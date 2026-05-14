@@ -1,0 +1,94 @@
+import { http, HttpResponse, ws } from 'msw'
+import type { CommissionedDevice } from '../Devices'
+
+type NodeConfig = { id: string; x: number; y: number; settings: Record<string, unknown> }
+type EdgeConfig = { id: string; source: string; target: string; sourceHandle?: string; targetHandle?: string }
+
+let nodeConfigs: NodeConfig[] = []
+let edgeConfigs: EdgeConfig[] = []
+
+let devices: CommissionedDevice[] = [
+  {
+    nodeId: 0x1001,
+    vendorName: 'Philips',
+    productName: 'Hue White',
+    deviceType: 0x0100,
+  },
+  {
+    nodeId: 0x1002,
+    vendorName: 'IKEA',
+    productName: 'TRADFRI bulb',
+    deviceType: 0x0100,
+  },
+  {
+    nodeId: 0x2001,
+    vendorName: 'Eve',
+    productName: 'Energy Plug',
+    deviceType: 0x010a,
+  },
+]
+
+const controllerWs = ws.link('ws://*/ws')
+
+export const handlers = [
+  http.get('/api/devices', () => {
+    return HttpResponse.json({ devices })
+  }),
+
+  http.delete('/api/devices/:nodeId', ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    devices = devices.filter(d => d.nodeId !== nodeId)
+    return HttpResponse.json({})
+  }),
+
+  http.get('/api/nodes', () => {
+    return HttpResponse.json({ nodes: nodeConfigs, edges: edgeConfigs })
+  }),
+
+  http.put('/api/nodes/:nodeId', async ({ params, request }) => {
+    const id = params.nodeId as string
+    const body = (await request.json()) as { x: number; y: number; settings?: Record<string, unknown> }
+    const existing = nodeConfigs.find(n => n.id === id)
+    if (existing) {
+      existing.x = body.x
+      existing.y = body.y
+      if (body.settings) existing.settings = { ...existing.settings, ...body.settings }
+    } else {
+      nodeConfigs.push({ id, x: body.x, y: body.y, settings: body.settings ?? {} })
+    }
+    return HttpResponse.json({})
+  }),
+
+  http.delete('/api/nodes/:nodeId', ({ params }) => {
+    const id = params.nodeId as string
+    nodeConfigs = nodeConfigs.filter(n => n.id !== id)
+    edgeConfigs = edgeConfigs.filter(e => e.source !== id && e.target !== id)
+    return HttpResponse.json({})
+  }),
+
+  http.post('/api/edges', async ({ request }) => {
+    const body = (await request.json()) as EdgeConfig
+    const existing = edgeConfigs.find(e => e.id === body.id)
+    if (!existing) edgeConfigs.push(body)
+    return HttpResponse.json({})
+  }),
+
+  http.delete('/api/edges/:edgeId', ({ params }) => {
+    const id = params.edgeId as string
+    edgeConfigs = edgeConfigs.filter(e => e.id !== id)
+    return HttpResponse.json({})
+  }),
+
+  controllerWs.addEventListener('connection', ({ client }) => {
+    // Simulate a new device being commissioned after 10 seconds
+    const timer = setTimeout(() => {
+      client.send(JSON.stringify({
+        type: 'device_commissioned',
+        data: { nodeId: 0x3001, vendorName: 'Shelly', productName: 'Plug S' },
+      }))
+      devices.push({ nodeId: 0x3001, vendorName: 'Shelly', productName: 'Plug S', deviceType: 0x010a })
+    }, 10000)
+
+    client.addEventListener('close', () => clearTimeout(timer))
+  }),
+]

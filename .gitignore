@@ -67,3 +67,17 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# ESP-IDF build artifacts
+firmware/build/
+firmware/managed_components/
+firmware/dependencies.lock
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# Node modules
+firmware/html_app/node_modules/
+
+firmware/html_compiled_app/
+# OS
+.DS_Store
