@@ -2,6 +2,7 @@ import { NavLink, Routes, Route } from 'react-router'
 import './App.css'
 import Canvas from './Canvas.tsx'
 import Devices from './Devices.tsx'
+import Thread from './Thread.tsx'
 
 import '@xyflow/react/dist/style.css';
 
@@ -22,6 +23,9 @@ function App() {
               <li className="nav-item">
                 <NavLink className="nav-link" to="/devices">Devices</NavLink>
               </li>
+              <li className="nav-item">
+                <NavLink className="nav-link" to="/thread">Thread</NavLink>
+              </li>
             </ul>
           </div>
         </div>
@@ -29,6 +33,7 @@ function App() {
       <Routes>
         <Route path="/" element={<Canvas />} />
         <Route path="/devices" element={<div className="container"><Devices /></div>} />
+        <Route path="/thread" element={<div className="container"><Thread /></div>} />
       </Routes>
     </>
   )

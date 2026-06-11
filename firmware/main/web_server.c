@@ -13,6 +13,7 @@
 
 #include "node_manager.h"
 #include "matter_controller.h"
+#include "thread_credentials.h"
 #include "ws_server.h"
 
 static const char *TAG = "web_server";
@@ -313,6 +314,102 @@ static esp_err_t edge_delete_handler(httpd_req_t *req)
 }
 
 // ---------------------------------------------------------------------------
+// Thread credential sharing
+// ---------------------------------------------------------------------------
+
+static esp_err_t thread_credentials_get_handler(httpd_req_t *req)
+{
+    char *json = thread_credentials_get_json();
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, json);
+    free(json);
+    return err;
+}
+
+static esp_err_t thread_credentials_delete_handler(httpd_req_t *req)
+{
+    esp_err_t err = thread_credentials_clear();
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Clear failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{}");
+}
+
+static esp_err_t thread_borderagents_get_handler(httpd_req_t *req)
+{
+    char *json = thread_credentials_discover_json(2000);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, json);
+    free(json);
+    return err;
+}
+
+static esp_err_t thread_credentials_fetch_handler(httpd_req_t *req)
+{
+    char body[MAX_POST_BODY + 1];
+    if (recv_body(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad JSON");
+        return ESP_FAIL;
+    }
+    cJSON *host_j = cJSON_GetObjectItemCaseSensitive(root, "host");
+    cJSON *port_j = cJSON_GetObjectItemCaseSensitive(root, "port");
+    cJSON *otpc_j = cJSON_GetObjectItemCaseSensitive(root, "otpc");
+    if (!cJSON_IsString(host_j) || !cJSON_IsString(otpc_j)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing host/otpc");
+        return ESP_FAIL;
+    }
+    char host[128];
+    char otpc[64];
+    strncpy(host, host_j->valuestring, sizeof(host) - 1);
+    host[sizeof(host) - 1] = '\0';
+    strncpy(otpc, otpc_j->valuestring, sizeof(otpc) - 1);
+    otpc[sizeof(otpc) - 1] = '\0';
+    uint16_t port = cJSON_IsNumber(port_j) ? (uint16_t)port_j->valuedouble : 0;
+    cJSON_Delete(root);
+
+    esp_err_t err = thread_credentials_fetch(host, port, otpc);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "error",
+            "Credential retrieval engine not yet implemented on this controller.");
+        httpd_resp_set_status(req, "501 Not Implemented");
+        return send_json(req, resp, 0);
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Credential fetch failed");
+        return ESP_FAIL;
+    }
+
+    // On success, return the freshly-stored credential metadata.
+    char *json = thread_credentials_get_json();
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t send_err = httpd_resp_sendstr(req, json);
+    free(json);
+    return send_err;
+}
+
+// ---------------------------------------------------------------------------
 // Debug endpoints
 // ---------------------------------------------------------------------------
 
@@ -403,7 +500,7 @@ esp_err_t web_server_start(void)
     config.lru_purge_enable = true;
     config.uri_match_fn     = httpd_uri_match_wildcard;
     config.stack_size       = 12288;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
     config.max_resp_headers = 20;
 
     httpd_handle_t server = NULL;
@@ -420,6 +517,10 @@ esp_err_t web_server_start(void)
     const httpd_uri_t node_delete        = {.uri = "/api/nodes/*",         .method = HTTP_DELETE, .handler = node_delete_handler};
     const httpd_uri_t edge_post          = {.uri = "/api/edges",           .method = HTTP_POST,   .handler = edge_post_handler};
     const httpd_uri_t edge_delete        = {.uri = "/api/edges/*",         .method = HTTP_DELETE, .handler = edge_delete_handler};
+    const httpd_uri_t thread_creds_get   = {.uri = "/api/thread/credentials",      .method = HTTP_GET,    .handler = thread_credentials_get_handler};
+    const httpd_uri_t thread_creds_del   = {.uri = "/api/thread/credentials",      .method = HTTP_DELETE, .handler = thread_credentials_delete_handler};
+    const httpd_uri_t thread_creds_fetch = {.uri = "/api/thread/credentials/fetch",.method = HTTP_POST,   .handler = thread_credentials_fetch_handler};
+    const httpd_uri_t thread_agents_get  = {.uri = "/api/thread/borderagents",     .method = HTTP_GET,    .handler = thread_borderagents_get_handler};
     const httpd_uri_t debug_files_list   = {.uri = "/debug/files",         .method = HTTP_GET,    .handler = debug_files_list_handler};
     const httpd_uri_t debug_files_get    = {.uri = "/debug/files/*",       .method = HTTP_GET,    .handler = debug_files_get_handler};
     const httpd_uri_t static_files       = {.uri = "/*",                   .method = HTTP_GET,    .handler = static_get_handler};
@@ -431,6 +532,10 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &node_delete);
     httpd_register_uri_handler(server, &edge_post);
     httpd_register_uri_handler(server, &edge_delete);
+    httpd_register_uri_handler(server, &thread_creds_get);
+    httpd_register_uri_handler(server, &thread_creds_del);
+    httpd_register_uri_handler(server, &thread_creds_fetch);
+    httpd_register_uri_handler(server, &thread_agents_get);
     httpd_register_uri_handler(server, &debug_files_list);
     httpd_register_uri_handler(server, &debug_files_get);
 

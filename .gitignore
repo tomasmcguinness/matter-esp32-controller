@@ -81,3 +81,5 @@ firmware/html_app/node_modules/
 firmware/html_compiled_app/
 # OS
 .DS_Store
+
+.claude/

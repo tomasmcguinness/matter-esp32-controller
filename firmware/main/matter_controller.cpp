@@ -213,17 +213,17 @@ static void interrogate_node(uint64_t node_id)
     attr_paths[1] = chip::app::AttributePathParams(0, kBasicInfoCluster, kBasicInfoVendorName);
     attr_paths[2] = chip::app::AttributePathParams(0, kBasicInfoCluster, kBasicInfoProductName);
 
-    chip::DeviceLayer::PlatformMgr().LockChipStack();
-    auto *cmd = new esp_matter::controller::read_command(
-        node_id,
-        std::move(attr_paths),
-        std::move(event_paths),
-        on_interrogation_attr,
-        on_interrogation_done,
-        nullptr);
-    if (cmd)
-        cmd->send_command();
-    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    // chip::DeviceLayer::PlatformMgr().LockChipStack();
+    // auto *cmd = new esp_matter::controller::read_command(
+    //     node_id,
+    //     std::move(attr_paths),
+    //     std::move(event_paths),
+    //     on_interrogation_attr,
+    //     on_interrogation_done,
+    //     nullptr);
+    // if (cmd)
+    //     cmd->send_command();
+    // chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +334,13 @@ esp_err_t matter_controller_commission_on_network(const char *onboarding_payload
     esp_matter::controller::pairing_command::get_instance().set_callbacks(callbacks);
 
     ESP_LOGI(TAG, "Attempting to commission node %llu", node_id);
+
+    // TODO(thread): when commissioning a Thread device (no on-network path
+    // available), switch to a BLE->Thread pairing flow and attach the shared
+    // Thread operational dataset retrieved via Thread Credential Sharing. The
+    // dataset is available from thread_credentials_get_dataset() once the
+    // controller has pulled it from a Border Router (see thread_credentials.h).
+    // Requires enabling BLE (CONFIG_BT_ENABLED + CHIP BLE) — deferred.
 
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     esp_matter::controller::pairing_code(node_id, onboarding_payload);

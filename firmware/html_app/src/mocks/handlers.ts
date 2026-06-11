@@ -1,5 +1,6 @@
 import { http, HttpResponse, ws } from 'msw'
 import type { CommissionedDevice } from '../Devices'
+import type { ThreadCredentials, BorderAgent } from '../Thread'
 
 type NodeConfig = { id: string; x: number; y: number; settings: Record<string, unknown> }
 type EdgeConfig = { id: string; source: string; target: string; sourceHandle?: string; targetHandle?: string }
@@ -26,6 +27,13 @@ let devices: CommissionedDevice[] = [
     productName: 'Energy Plug',
     deviceType: 0x010a,
   },
+]
+
+let threadCredentials: ThreadCredentials = { hasCredentials: false }
+
+const borderAgents: BorderAgent[] = [
+  { host: 'otbr-living-room.local', ip: '192.168.1.50', port: 49191, networkName: 'MyHome-Thread' },
+  { host: 'otbr-office.local', ip: '192.168.1.51', port: 49152, networkName: 'Office-Thread' },
 ]
 
 const controllerWs = ws.link('ws://*/ws')
@@ -77,6 +85,34 @@ export const handlers = [
     const id = params.edgeId as string
     edgeConfigs = edgeConfigs.filter(e => e.id !== id)
     return HttpResponse.json({})
+  }),
+
+  http.get('/api/thread/credentials', () => {
+    return HttpResponse.json(threadCredentials)
+  }),
+
+  http.delete('/api/thread/credentials', () => {
+    threadCredentials = { hasCredentials: false }
+    return HttpResponse.json({})
+  }),
+
+  http.get('/api/thread/borderagents', () => {
+    return HttpResponse.json({ agents: borderAgents })
+  }),
+
+  http.post('/api/thread/credentials/fetch', async ({ request }) => {
+    const body = (await request.json()) as { host: string; port: number; otpc: string }
+    const agent = borderAgents.find(a => a.host === body.host)
+    threadCredentials = {
+      hasCredentials: true,
+      networkName: agent?.networkName ?? 'Thread network',
+      channel: 15,
+      panId: 0x1234,
+      extPanId: 'DEAD00BEEF00CAFE',
+      fetchedAt: Math.floor(Date.now() / 1000),
+      borderAgentHost: body.host,
+    }
+    return HttpResponse.json(threadCredentials)
   }),
 
   controllerWs.addEventListener('connection', ({ client }) => {
