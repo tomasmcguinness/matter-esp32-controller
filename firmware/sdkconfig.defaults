@@ -37,6 +37,12 @@ CONFIG_ESP_MATTER_COMMISSIONER_ENABLE=y
 # Enable HKDF in mbedtls (required by Matter)
 CONFIG_MBEDTLS_HKDF_C=y
 
+# Thread 1.4 Credential Sharing engine: MeshCoP commissioner runs DTLS with the
+# EC-JPAKE (TLS-ECJPAKE-WITH-AES-128-CCM-8) key exchange against the Border Agent.
+CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+CONFIG_MBEDTLS_ECJPAKE_C=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE=y
+
 # Enable chip shell for debugging
 CONFIG_ENABLE_CHIP_SHELL=y
 CONFIG_ESP_MATTER_CONSOLE_TASK_STACK=4096

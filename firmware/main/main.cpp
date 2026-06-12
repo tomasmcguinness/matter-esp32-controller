@@ -9,6 +9,7 @@
 #include "node_manager.h"
 #include "matter_controller.h"
 #include "thread_credentials.h"
+#include "controller_mdns.h"
 #include "web_server.h"
 
 static const char *TAG = "main";
@@ -24,6 +25,8 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(thread_credentials_init());
 
     ESP_ERROR_CHECK(matter_controller_start());
+
+    ESP_ERROR_CHECK(controller_mdns_start());
 
     ESP_ERROR_CHECK(web_server_start());
 

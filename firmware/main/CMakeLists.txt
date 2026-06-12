@@ -4,10 +4,12 @@ idf_component_register(SRCS
         "ws_server.c"
         "matter_controller.cpp"
         "matter_ethernet_driver.cpp"
+        "controller_mdns.cpp"
         "node_manager.cpp"
         "thread_credentials.cpp"
+        "thread_meshcop.cpp"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES json esp_eth esp_netif driver nvs_flash esp_http_server mdns espressif__esp_matter
+    PRIV_REQUIRES json esp_eth esp_netif driver nvs_flash esp_http_server mdns espressif__esp_matter mbedtls lwip esp_timer
 )
 
 add_custom_target(react_build

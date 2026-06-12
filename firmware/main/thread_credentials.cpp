@@ -13,6 +13,7 @@
 #include "freertos/semphr.h"
 #include "cJSON.h"
 #include "mdns.h"
+#include "thread_meshcop.h"
 
 static const char *TAG = "thread_creds";
 
@@ -291,20 +292,21 @@ esp_err_t thread_credentials_store(const uint8_t *dataset, size_t dataset_len,
 
 esp_err_t thread_credentials_fetch(const char *host, uint16_t port, const char *otpc)
 {
-    // TODO(thread-engine): implement the Thread 1.4 Credential Sharing exchange.
-    //   1. Resolve `host`/`port` (border agent advertised via _meshcop-e._udp).
-    //   2. Derive the ePSKc from `otpc` (one-time passcode).
-    //   3. Open a DTLS (ECJPAKE) session to the border agent using the ePSKc.
-    //   4. Petition as a commissioner candidate, then MGMT_ACTIVE_GET to pull
-    //      the Active Operational Dataset over CoAP/TMF.
-    //   5. Call thread_credentials_store(dataset, len, host) to persist.
-    // Engine approach is being decided in the OpenThread-reuse feasibility spike
-    // (firmware/docs/thread-credential-sharing-feasibility.md).
-    (void)host;
-    (void)port;
-    (void)otpc;
-    ESP_LOGW(TAG, "thread_credentials_fetch: retrieval engine not yet implemented");
-    return ESP_ERR_NOT_SUPPORTED;
+    if (!host || !otpc) return ESP_ERR_INVALID_ARG;
+
+    // Run the Thread 1.4 Credential Sharing exchange (DTLS-ECJPAKE + CoAP/MeshCoP)
+    // against the border agent and pull the Active Operational Dataset.
+    uint8_t dataset[MAX_DATASET_LEN];
+    size_t dataset_len = 0;
+    esp_err_t err = thread_meshcop_pull_dataset(host, port, otpc,
+                                                dataset, sizeof(dataset), &dataset_len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Credential retrieval from %s failed: 0x%x", host, err);
+        return err;
+    }
+
+    // Persist the raw dataset and the parsed display metadata.
+    return thread_credentials_store(dataset, dataset_len, host);
 }
 
 esp_err_t thread_credentials_get_dataset(uint8_t *buf, size_t buf_size, size_t *out_len)
