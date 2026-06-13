@@ -25,6 +25,8 @@ namespace chip {
 namespace DeviceLayer {
 namespace NetworkCommissioning {
 
+#if CONFIG_ENABLE_ETHERNET_TELEMETRY
+
 static void on_eth_event(void *esp_netif, esp_event_base_t event_base,
                          int32_t event_id, void *event_data)
 {
@@ -94,6 +96,16 @@ CHIP_ERROR ESPEthernetDriver::Init(NetworkStatusChangeCallback *networkStatusCha
     ESP_LOGI(TAG, "W5500 Ethernet initialised");
     return CHIP_NO_ERROR;
 }
+
+#else // !CONFIG_ENABLE_ETHERNET_TELEMETRY
+
+CHIP_ERROR ESPEthernetDriver::Init(NetworkStatusChangeCallback *networkStatusChangeCallback)
+{
+    ESP_LOGI(TAG, "W5500 Ethernet driver compiled out (CONFIG_ENABLE_ETHERNET_TELEMETRY=n)");
+    return CHIP_NO_ERROR;
+}
+
+#endif // CONFIG_ENABLE_ETHERNET_TELEMETRY
 
 } // namespace NetworkCommissioning
 } // namespace DeviceLayer

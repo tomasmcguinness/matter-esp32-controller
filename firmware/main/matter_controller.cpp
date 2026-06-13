@@ -406,6 +406,7 @@ esp_err_t matter_controller_start(void)
         return err;
     }
 
+#if CONFIG_ENABLE_ETHERNET_TELEMETRY
     // Controller mode disables the Matter server, so the NetworkCommissioning
     // cluster never initialises the Ethernet driver automatically. Call it directly.
     CHIP_ERROR eth_err = chip::DeviceLayer::NetworkCommissioning::ESPEthernetDriver::GetInstance().Init(nullptr);
@@ -413,6 +414,9 @@ esp_err_t matter_controller_start(void)
         ESP_LOGE(TAG, "ESPEthernetDriver::Init failed: %" CHIP_ERROR_FORMAT, eth_err.Format());
         return ESP_FAIL;
     }
+#else
+    ESP_LOGI(TAG, "W5500 Ethernet disabled (CONFIG_ENABLE_ETHERNET_TELEMETRY=n)");
+#endif
 
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     err = esp_matter::controller::matter_controller_client::get_instance().init(112233, 1, 5580);
