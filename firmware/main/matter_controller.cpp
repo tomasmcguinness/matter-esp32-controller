@@ -13,6 +13,9 @@
 
 #include "ws_server.h"
 #include "cJSON.h"
+#include "device_manager.h"
+#include "node_manager.h"
+#include "pairing_command.h"
 
 #include <app/server/Dnssd.h>
 #include <controller/CHIPDeviceController.h>
@@ -46,9 +49,12 @@ static constexpr uint64_t kFirstDeviceNodeId = 1;
 
 static constexpr uint32_t kDescriptorCluster     = 0x001D;
 static constexpr uint32_t kDescriptorDeviceTypeList = 0x0000;
+static constexpr uint32_t kDescriptorPartsList   = 0x0003;
 static constexpr uint32_t kBasicInfoCluster      = 0x0028;
 static constexpr uint32_t kBasicInfoVendorName   = 0x0002;
 static constexpr uint32_t kBasicInfoProductName  = 0x0004;
+static constexpr uint32_t kBridgedDeviceBasicInfoCluster = 0x0039;
+static constexpr uint32_t kBridgedDeviceNodeLabel        = 0x0005;
 static constexpr uint32_t kDevTypeRootNode       = 0x0016;
 
 // ---------------------------------------------------------------------------
@@ -138,48 +144,102 @@ static uint32_t select_primary_device_type(const std::map<uint16_t, std::vector<
     return 0;
 }
 
+// Signalled by on_interrogation_done so the commissioning call can block until
+// devices.json and the canvas node have been written.
+static SemaphoreHandle_t s_interrogation_done = nullptr;
+
+// Add the freshly-interrogated device to the ReactFlow canvas (nodes.json).
+static void add_canvas_node(uint64_t node_id, uint32_t primary_type)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%llu", (unsigned long long)node_id);
+
+    // Stagger nodes in a 4-wide grid based on their (1-based) node id.
+    uint64_t idx = (node_id > 0) ? (node_id - 1) : 0;
+    float x = 80.0f + 200.0f * (float)(idx % 4);
+    float y = 80.0f + 160.0f * (float)(idx / 4);
+
+    cJSON *settings = cJSON_CreateObject();
+    char label[40];
+    snprintf(label, sizeof(label), "Node 0x%llX", (unsigned long long)node_id);
+    cJSON_AddStringToObject(settings, "label", label);
+    cJSON_AddNumberToObject(settings, "nodeId", (double)node_id);
+    cJSON_AddNumberToObject(settings, "deviceType", (double)primary_type);
+    char *settings_json = cJSON_PrintUnformatted(settings);
+    cJSON_Delete(settings);
+
+    node_manager_upsert(id, x, y, settings_json);
+    free(settings_json);
+}
+
 static void on_interrogation_attr(uint64_t node_id,
                                   const chip::app::ConcreteDataAttributePath &path,
-                                  chip::TLV::TLVReader *data,
-                                  const chip::app::StatusIB &status)
+                                  chip::TLV::TLVReader *data)
 {
-    using namespace chip::Protocols::InteractionModel;
-    if (!data || status.mStatus != Status::Success)
+    if (!data)
         return;
 
-    if (path.mClusterId == kDescriptorCluster &&
-        path.mAttributeId == kDescriptorDeviceTypeList)
+    if (path.mClusterId == kDescriptorCluster)
     {
-        chip::TLV::TLVType list_type;
-        if (data->EnterContainer(list_type) != CHIP_NO_ERROR)
-            return;
-        while (data->Next() == CHIP_NO_ERROR) {
-            chip::TLV::TLVType struct_type;
-            if (data->EnterContainer(struct_type) != CHIP_NO_ERROR)
-                continue;
-            uint32_t device_type = 0;
+        if (path.mAttributeId == kDescriptorPartsList)
+        {
+            chip::TLV::TLVType outer;
+            if (data->EnterContainer(outer) != CHIP_NO_ERROR)
+                return;
             while (data->Next() == CHIP_NO_ERROR) {
-                if (chip::TLV::TagNumFromTag(data->GetTag()) == 0)
-                    data->Get(device_type);
+                uint16_t ep_id = 0;
+                if (data->Get(ep_id) == CHIP_NO_ERROR) {
+                    device_manager_add_endpoint(node_id, ep_id);
+                    device_manager_add_endpoint_part(node_id, path.mEndpointId, ep_id);
+                }
             }
-            data->ExitContainer(struct_type);
-            if (device_type != 0) {
-                xSemaphoreTake(s_pending_mutex, portMAX_DELAY);
-                s_pending_types[node_id][path.mEndpointId].push_back(device_type);
-                xSemaphoreGive(s_pending_mutex);
-            }
+            data->ExitContainer(outer);
         }
-        data->ExitContainer(list_type);
+        else if (path.mAttributeId == kDescriptorDeviceTypeList)
+        {
+            device_manager_add_endpoint(node_id, path.mEndpointId);
+            chip::TLV::TLVType list_type;
+            if (data->EnterContainer(list_type) != CHIP_NO_ERROR)
+                return;
+            while (data->Next() == CHIP_NO_ERROR) {
+                chip::TLV::TLVType struct_type;
+                if (data->EnterContainer(struct_type) != CHIP_NO_ERROR)
+                    continue;
+                uint32_t device_type = 0;
+                while (data->Next() == CHIP_NO_ERROR) {
+                    if (chip::TLV::TagNumFromTag(data->GetTag()) == 0)
+                        data->Get(device_type);
+                }
+                data->ExitContainer(struct_type);
+                if (device_type != 0) {
+                    device_manager_add_device_type(node_id, path.mEndpointId, device_type);
+                    xSemaphoreTake(s_pending_mutex, portMAX_DELAY);
+                    s_pending_types[node_id][path.mEndpointId].push_back(device_type);
+                    xSemaphoreGive(s_pending_mutex);
+                }
+            }
+            data->ExitContainer(list_type);
+        }
     }
     else if (path.mClusterId == kBasicInfoCluster)
     {
         chip::CharSpan str;
         if (data->Get(str) != CHIP_NO_ERROR)
             return;
-        //if (path.mAttributeId == kBasicInfoVendorName)
-            //device_manager_set_vendor_name(node_id, str.data(), str.size());
-        //else if (path.mAttributeId == kBasicInfoProductName)
-            //device_manager_set_product_name(node_id, str.data(), str.size());
+        if (path.mAttributeId == kBasicInfoVendorName)
+            device_manager_set_vendor_name(node_id, str.data(), str.size());
+        else if (path.mAttributeId == kBasicInfoProductName)
+            device_manager_set_product_name(node_id, str.data(), str.size());
+    }
+    else if (path.mClusterId == kBridgedDeviceBasicInfoCluster &&
+             path.mAttributeId == kBridgedDeviceNodeLabel)
+    {
+        // Per-endpoint: each bridged child carries its own NodeLabel.
+        chip::CharSpan str;
+        if (data->Get(str) == CHIP_NO_ERROR) {
+            device_manager_add_endpoint(node_id, path.mEndpointId);
+            device_manager_set_endpoint_label(node_id, path.mEndpointId, str.data(), str.size());
+        }
     }
 }
 
@@ -197,33 +257,50 @@ static void on_interrogation_done(uint64_t node_id,
         s_pending_types.erase(it);
     }
     xSemaphoreGive(s_pending_mutex);
+
+    device_manager_set_primary_device_type(node_id, primary_type);
+    device_manager_log_structure(node_id);
+    device_manager_resolve_parents(node_id);
+    device_manager_persist();
+
+    // Mirror the device onto the ReactFlow canvas.
+    add_canvas_node(node_id, primary_type);
+
+    if (s_interrogation_done)
+        xSemaphoreGive(s_interrogation_done);
 }
 
 static void interrogate_node(uint64_t node_id)
 {
+    device_manager_add_device(node_id);
+
     chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> attr_paths;
     chip::Platform::ScopedMemoryBufferWithSize<chip::app::EventPathParams> event_paths;
-    attr_paths.Alloc(3);
+    attr_paths.Alloc(4);
     if (!attr_paths.Get()) {
         ESP_LOGE(TAG, "Failed to allocate attribute paths for interrogation");
         return;
     }
 
+    // Descriptor cluster on all endpoints (wildcard), all attributes.
     attr_paths[0] = chip::app::AttributePathParams(chip::kInvalidEndpointId, kDescriptorCluster, chip::kInvalidAttributeId);
+    // BasicInformation VendorName and ProductName from endpoint 0.
     attr_paths[1] = chip::app::AttributePathParams(0, kBasicInfoCluster, kBasicInfoVendorName);
     attr_paths[2] = chip::app::AttributePathParams(0, kBasicInfoCluster, kBasicInfoProductName);
+    // BridgedDeviceBasicInformation NodeLabel on all endpoints (wildcard).
+    attr_paths[3] = chip::app::AttributePathParams(chip::kInvalidEndpointId, kBridgedDeviceBasicInfoCluster, kBridgedDeviceNodeLabel);
 
-    // chip::DeviceLayer::PlatformMgr().LockChipStack();
-    // auto *cmd = new esp_matter::controller::read_command(
-    //     node_id,
-    //     std::move(attr_paths),
-    //     std::move(event_paths),
-    //     on_interrogation_attr,
-    //     on_interrogation_done,
-    //     nullptr);
-    // if (cmd)
-    //     cmd->send_command();
-    // chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    auto *cmd = new esp_matter::controller::read_command(
+        node_id,
+        std::move(attr_paths),
+        std::move(event_paths),
+        on_interrogation_attr,
+        on_interrogation_done,
+        nullptr);
+    if (cmd)
+        cmd->send_command();
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +444,83 @@ esp_err_t matter_controller_commission_on_network(const char *onboarding_payload
 }
 
 // ---------------------------------------------------------------------------
+// Blocking BLE + Wi-Fi commissioning
+// ---------------------------------------------------------------------------
+
+// Hardcoded Wi-Fi credentials handed to devices over BLE during commissioning.
+static constexpr char kCommissioningSsid[]     = "JARVIS";
+static constexpr char kCommissioningPassword[] = "pmuvevfu";
+
+esp_err_t matter_controller_commission_ble_wifi(const char *onboarding_payload, uint64_t *node_id_out)
+{
+    chip::SetupPayload payload;
+    CHIP_ERROR parse_err;
+
+    if (strncmp(onboarding_payload, "MT:", 3) == 0)
+        parse_err = chip::QRCodeSetupPayloadParser(onboarding_payload).populatePayload(payload);
+    else
+        parse_err = chip::ManualSetupPayloadParser(onboarding_payload).populatePayload(payload);
+
+    if (parse_err != CHIP_NO_ERROR) {
+        ESP_LOGE(TAG, "Failed to parse onboarding payload: %" CHIP_ERROR_FORMAT, parse_err.Format());
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_commission_ctx.done = xSemaphoreCreateBinary();
+    s_commission_ctx.result = CHIP_NO_ERROR;
+    if (!s_commission_ctx.done)
+        return ESP_ERR_NO_MEM;
+
+    chip::NodeId node_id = matter_controller_allocate_node_id();
+
+    home_energy_manager::controller::pairing_command_callbacks_t callbacks = {
+        .commissioning_success_callback = on_commissioning_success_callback,
+        .commissioning_failure_callback = on_commissioning_failure_callback,
+    };
+    home_energy_manager::controller::pairing_command::get_instance().set_callbacks(callbacks);
+
+    ESP_LOGI(TAG, "Attempting BLE+Wi-Fi commission of node %llu onto SSID '%s'",
+             (unsigned long long)node_id, kCommissioningSsid);
+
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    esp_err_t pair_err = home_energy_manager::controller::pairing_command::pairing_code_wifi(
+        node_id, kCommissioningSsid, kCommissioningPassword, onboarding_payload);
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+
+    if (pair_err != ESP_OK) {
+        ESP_LOGE(TAG, "pairing_code_wifi failed to start: 0x%x", pair_err);
+        vSemaphoreDelete(s_commission_ctx.done);
+        return pair_err;
+    }
+
+    if (xSemaphoreTake(s_commission_ctx.done, pdMS_TO_TICKS(120000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Commissioning timed out");
+        vSemaphoreDelete(s_commission_ctx.done);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    CHIP_ERROR result = s_commission_ctx.result;
+    vSemaphoreDelete(s_commission_ctx.done);
+
+    if (result == CHIP_NO_ERROR) {
+        if (node_id_out)
+            *node_id_out = (uint64_t)node_id;
+        node_list_add(node_id);
+        // Interrogate and wait until devices.json / nodes.json are written so the
+        // HTTP response only returns once the device is fully recorded.
+        interrogate_node(node_id);
+        if (s_interrogation_done &&
+            xSemaphoreTake(s_interrogation_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
+            ESP_LOGW(TAG, "Interrogation did not finish in time for node 0x%llx",
+                     (unsigned long long)node_id);
+        }
+        return ESP_OK;
+    }
+
+    return ESP_FAIL;
+}
+
+// ---------------------------------------------------------------------------
 // Public re-interrogation
 // ---------------------------------------------------------------------------
 
@@ -390,6 +544,10 @@ esp_err_t matter_controller_start(void)
 {
     s_pending_mutex = xSemaphoreCreateMutex();
     if (!s_pending_mutex)
+        return ESP_ERR_NO_MEM;
+
+    s_interrogation_done = xSemaphoreCreateBinary();
+    if (!s_interrogation_done)
         return ESP_ERR_NO_MEM;
 
 #if CONFIG_ENABLE_CHIP_SHELL

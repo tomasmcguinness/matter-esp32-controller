@@ -38,7 +38,25 @@ const borderAgents: BorderAgent[] = [
 
 const controllerWs = ws.link('ws://*/ws')
 
+let nextMockNodeId = 0x4001
+
 export const handlers = [
+  http.post('/controller/commission', async ({ request }) => {
+    const body = (await request.json()) as { onboardingPayload: string }
+    if (!body?.onboardingPayload) {
+      return new HttpResponse('Missing onboardingPayload', { status: 400 })
+    }
+    const nodeId = nextMockNodeId++
+    devices.push({ nodeId, vendorName: 'Acme', productName: 'Smart Plug', deviceType: 0x010a })
+    nodeConfigs.push({
+      id: String(nodeId),
+      x: 80 + 200 * (nodeConfigs.length % 4),
+      y: 80 + 160 * Math.floor(nodeConfigs.length / 4),
+      settings: { label: `Node 0x${nodeId.toString(16).toUpperCase()}`, nodeId, deviceType: 0x010a },
+    })
+    return HttpResponse.json({ nodeId })
+  }),
+
   http.get('/api/devices', () => {
     return HttpResponse.json({ devices })
   }),

@@ -1,6 +1,7 @@
 #include "web_server.h"
 
 #include <string.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -12,6 +13,7 @@
 #include "cJSON.h"
 
 #include "node_manager.h"
+#include "device_manager.h"
 #include "matter_controller.h"
 #include "thread_credentials.h"
 #include "ws_server.h"
@@ -121,10 +123,10 @@ static esp_err_t controller_commission_post_handler(httpd_req_t *req)
     payload[sizeof(payload) - 1] = '\0';
     cJSON_Delete(root);
 
-    ESP_LOGI(TAG, "Beginning on-network commissioning: %s", payload);
+    ESP_LOGI(TAG, "Beginning BLE+Wi-Fi commissioning: %s", payload);
 
     uint64_t commissioned_node_id = 0;
-    esp_err_t err = matter_controller_commission_on_network(payload, &commissioned_node_id);
+    esp_err_t err = matter_controller_commission_ble_wifi(payload, &commissioned_node_id);
 
     if (err == ESP_ERR_INVALID_ARG) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid onboarding payload");
@@ -158,6 +160,50 @@ static esp_err_t factory_reset_post_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{}");
     return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/devices
+// ---------------------------------------------------------------------------
+
+static esp_err_t devices_get_handler(httpd_req_t *req)
+{
+    char *json = device_manager_get_all_json();
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, json);
+    free(json);
+    return err;
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/devices/:nodeId
+// ---------------------------------------------------------------------------
+
+static esp_err_t device_delete_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    const char *node_id_str = last_slash + 1;
+    uint64_t node_id = strtoull(node_id_str, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    // Best-effort: remove the fabric from the device, then drop our local records.
+    matter_controller_remove_node(node_id);
+    device_manager_remove_device(node_id);
+    node_manager_delete(node_id_str);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{}");
 }
 
 // ---------------------------------------------------------------------------
@@ -500,7 +546,7 @@ esp_err_t web_server_start(void)
     config.lru_purge_enable = true;
     config.uri_match_fn     = httpd_uri_match_wildcard;
     config.stack_size       = 12288;
-    config.max_uri_handlers = 20;
+    config.max_uri_handlers = 22;
     config.max_resp_headers = 20;
 
     httpd_handle_t server = NULL;
@@ -512,6 +558,8 @@ esp_err_t web_server_start(void)
 
     const httpd_uri_t commission_post    = {.uri = "/controller/commission",.method = HTTP_POST,   .handler = controller_commission_post_handler};
     const httpd_uri_t factory_reset      = {.uri = "/api/factory-reset",   .method = HTTP_POST,   .handler = factory_reset_post_handler};
+    const httpd_uri_t devices_get        = {.uri = "/api/devices",         .method = HTTP_GET,    .handler = devices_get_handler};
+    const httpd_uri_t device_delete      = {.uri = "/api/devices/*",       .method = HTTP_DELETE, .handler = device_delete_handler};
     const httpd_uri_t nodes_get          = {.uri = "/api/nodes",           .method = HTTP_GET,    .handler = nodes_get_handler};
     const httpd_uri_t node_put           = {.uri = "/api/nodes/*",         .method = HTTP_PUT,    .handler = node_put_handler};
     const httpd_uri_t node_delete        = {.uri = "/api/nodes/*",         .method = HTTP_DELETE, .handler = node_delete_handler};
@@ -527,6 +575,8 @@ esp_err_t web_server_start(void)
 
     httpd_register_uri_handler(server, &commission_post);
     httpd_register_uri_handler(server, &factory_reset);
+    httpd_register_uri_handler(server, &devices_get);
+    httpd_register_uri_handler(server, &device_delete);
     httpd_register_uri_handler(server, &nodes_get);
     httpd_register_uri_handler(server, &node_put);
     httpd_register_uri_handler(server, &node_delete);

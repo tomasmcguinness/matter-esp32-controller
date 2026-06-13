@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router'
 import { deviceTypeName, deviceTypeIcon } from './deviceTypeName'
 
 export type CommissionedDevice = {
@@ -13,6 +14,7 @@ type DevicesResponse = {
 }
 
 function Devices() {
+  const navigate = useNavigate()
   const [devices, setDevices] = useState<CommissionedDevice[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -42,8 +44,11 @@ function Devices() {
 
   return (
     <>
-      <div className="mt-3 mb-2">
+      <div className="mt-3 mb-2 d-flex align-items-center justify-content-between">
         <h1>Devices</h1>
+        <button className="btn btn-primary" onClick={() => navigate('/devices/pair')}>
+          Pair Device
+        </button>
       </div>
       <hr />
       {error && <div className="alert alert-danger">{error}</div>}

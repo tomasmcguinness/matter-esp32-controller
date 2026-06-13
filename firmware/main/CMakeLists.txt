@@ -6,6 +6,8 @@ idf_component_register(SRCS
         "matter_ethernet_driver.cpp"
         "controller_mdns.cpp"
         "node_manager.cpp"
+        "device_manager.cpp"
+        "pairing_command.cpp"
         "thread_credentials.cpp"
         "thread_meshcop.cpp"
     INCLUDE_DIRS "."
