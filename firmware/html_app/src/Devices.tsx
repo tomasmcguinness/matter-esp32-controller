@@ -18,18 +18,18 @@ function Devices() {
   const [devices, setDevices] = useState<CommissionedDevice[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [reinterviewing, setReinterviewing] = useState<number | null>(null)
+
+  function loadDevices() {
+    return fetch('/api/devices')
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<DevicesResponse> })
+      .then(data => setDevices(data.devices))
+  }
 
   useEffect(() => {
-    fetch('/api/devices')
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<DevicesResponse> })
-      .then(data => {
-        setDevices(data.devices)
-        setLoading(false)
-      })
-      .catch((e: unknown) => {
-        setError(e instanceof Error ? e.message : 'Failed to load devices')
-        setLoading(false)
-      })
+    loadDevices()
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Failed to load devices'))
+      .finally(() => setLoading(false))
   }, [])
 
   function handleDelete(nodeId: number) {
@@ -38,6 +38,16 @@ function Devices() {
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`) })
       .then(() => setDevices(prev => prev.filter(d => d.nodeId !== nodeId)))
       .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Delete failed'))
+  }
+
+  function handleReinterview(nodeId: number) {
+    setError(null)
+    setReinterviewing(nodeId)
+    fetch(`/api/reinterview/${nodeId}`, { method: 'POST' })
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`) })
+      .then(() => loadDevices())
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Re-interview failed'))
+      .finally(() => setReinterviewing(null))
   }
 
   if (loading) return <p className="mt-3">Loading…</p>
@@ -80,7 +90,18 @@ function Devices() {
                   </span>
                 </div>
                 <div style={{ padding: '8px 12px', borderTop: '1px solid #dee2e6' }} className="d-flex gap-2">
-                  <button className="btn btn-danger btn-sm" onClick={() => handleDelete(dev.nodeId)}>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    disabled={reinterviewing !== null}
+                    onClick={() => handleReinterview(dev.nodeId)}
+                  >
+                    {reinterviewing === dev.nodeId ? 'Re-interviewing…' : 'Re-interview'}
+                  </button>
+                  <button
+                    className="btn btn-danger btn-sm"
+                    disabled={reinterviewing !== null}
+                    onClick={() => handleDelete(dev.nodeId)}
+                  >
                     Remove
                   </button>
                 </div>

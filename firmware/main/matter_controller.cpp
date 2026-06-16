@@ -8,6 +8,7 @@
 #include <esp_matter_controller_client.h>
 #include <esp_matter_controller_console.h>
 #include <esp_matter_controller_credentials_issuer.h>
+#include <esp_matter_controller_cluster_command.h>
 #include <esp_matter_controller_pairing_command.h>
 #include <esp_matter_controller_read_command.h>
 
@@ -56,6 +57,10 @@ static constexpr uint32_t kBasicInfoProductName  = 0x0004;
 static constexpr uint32_t kBridgedDeviceBasicInfoCluster = 0x0039;
 static constexpr uint32_t kBridgedDeviceNodeLabel        = 0x0005;
 static constexpr uint32_t kDevTypeRootNode       = 0x0016;
+static constexpr uint32_t kOnOffCluster          = 0x0006;
+static constexpr uint32_t kOnOffAttribute        = 0x0000;
+static constexpr uint32_t kOnOffCmdOff           = 0x00;
+static constexpr uint32_t kOnOffCmdOn            = 0x01;
 
 // ---------------------------------------------------------------------------
 // Node ID counter (NVS)
@@ -304,6 +309,110 @@ static void interrogate_node(uint64_t node_id)
 }
 
 // ---------------------------------------------------------------------------
+// OnOff read / write
+// ---------------------------------------------------------------------------
+
+static SemaphoreHandle_t s_onoff_read_done = nullptr;
+static bool s_onoff_read_value = false;
+static bool s_onoff_read_ok = false;
+
+static void on_onoff_read_attr(uint64_t node_id,
+                               const chip::app::ConcreteDataAttributePath &path,
+                               chip::TLV::TLVReader *data)
+{
+    if (!data)
+        return;
+    if (path.mClusterId == kOnOffCluster && path.mAttributeId == kOnOffAttribute) {
+        bool value = false;
+        if (data->Get(value) == CHIP_NO_ERROR) {
+            s_onoff_read_value = value;
+            s_onoff_read_ok = true;
+        }
+    }
+}
+
+static void on_onoff_read_done(uint64_t node_id,
+                               const chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> &,
+                               const chip::Platform::ScopedMemoryBufferWithSize<chip::app::EventPathParams> &)
+{
+    if (s_onoff_read_done)
+        xSemaphoreGive(s_onoff_read_done);
+}
+
+esp_err_t matter_controller_get_onoff(uint64_t node_id, bool *on_out)
+{
+    if (!on_out)
+        return ESP_ERR_INVALID_ARG;
+
+    uint16_t endpoint_id = 0;
+    esp_err_t err = device_manager_get_onoff_endpoint(node_id, &endpoint_id);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No OnOff endpoint for node 0x%llx", (unsigned long long)node_id);
+        return err;
+    }
+
+    if (!s_onoff_read_done) {
+        s_onoff_read_done = xSemaphoreCreateBinary();
+        if (!s_onoff_read_done)
+            return ESP_ERR_NO_MEM;
+    }
+    s_onoff_read_ok = false;
+    s_onoff_read_value = false;
+
+    chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> attr_paths;
+    chip::Platform::ScopedMemoryBufferWithSize<chip::app::EventPathParams> event_paths;
+    attr_paths.Alloc(1);
+    if (!attr_paths.Get())
+        return ESP_ERR_NO_MEM;
+    attr_paths[0] = chip::app::AttributePathParams(endpoint_id, kOnOffCluster, kOnOffAttribute);
+
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    auto *cmd = new esp_matter::controller::read_command(
+        node_id,
+        std::move(attr_paths),
+        std::move(event_paths),
+        on_onoff_read_attr,
+        on_onoff_read_done,
+        nullptr);
+    if (cmd)
+        cmd->send_command();
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+
+    if (!cmd)
+        return ESP_ERR_NO_MEM;
+
+    if (xSemaphoreTake(s_onoff_read_done, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "OnOff read timed out for node 0x%llx", (unsigned long long)node_id);
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!s_onoff_read_ok)
+        return ESP_FAIL;
+
+    *on_out = s_onoff_read_value;
+    return ESP_OK;
+}
+
+esp_err_t matter_controller_set_onoff(uint64_t node_id, bool on)
+{
+    uint16_t endpoint_id = 0;
+    esp_err_t err = device_manager_get_onoff_endpoint(node_id, &endpoint_id);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No OnOff endpoint for node 0x%llx", (unsigned long long)node_id);
+        return err;
+    }
+
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    err = esp_matter::controller::send_invoke_cluster_command(
+        node_id, endpoint_id, kOnOffCluster,
+        on ? kOnOffCmdOn : kOnOffCmdOff, "{}");
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "OnOff command failed for node 0x%llx: 0x%x", (unsigned long long)node_id, err);
+    return err;
+}
+
+// ---------------------------------------------------------------------------
 // Blocking unpair
 // ---------------------------------------------------------------------------
 
@@ -527,7 +636,23 @@ esp_err_t matter_controller_commission_ble_wifi(const char *onboarding_payload, 
 
 esp_err_t matter_controller_interrogate_node(uint64_t node_id)
 {
+    // Drop the stale endpoint structure so the refresh reflects the device as it
+    // is now (endpoints/types that disappeared are not re-added by the read).
+    device_manager_clear_device_endpoints(node_id);
+
+    // Drain any leftover completion signal (commissioning fires interrogation
+    // without consuming it), then block until this interrogation finishes so the
+    // caller sees freshly persisted data.
+    if (s_interrogation_done)
+        xSemaphoreTake(s_interrogation_done, 0);
+
     interrogate_node(node_id);
+
+    if (s_interrogation_done &&
+        xSemaphoreTake(s_interrogation_done, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Re-interview of node 0x%llx timed out", (unsigned long long)node_id);
+        return ESP_ERR_TIMEOUT;
+    }
     return ESP_OK;
 }
 

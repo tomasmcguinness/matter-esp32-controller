@@ -207,6 +207,108 @@ static esp_err_t device_delete_handler(httpd_req_t *req)
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/reinterview/:nodeId  -> re-read the device's structure
+// ---------------------------------------------------------------------------
+
+static esp_err_t reinterview_post_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = matter_controller_interrogate_node(node_id);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Re-interview failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{}");
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/onoff/:nodeId  -> { "on": bool }
+// ---------------------------------------------------------------------------
+
+static esp_err_t onoff_get_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    bool on = false;
+    esp_err_t err = matter_controller_get_onoff(node_id, &on);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read OnOff state");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, on ? "{\"on\":true}" : "{\"on\":false}");
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/onoff/:nodeId  body { "on": bool }
+// ---------------------------------------------------------------------------
+
+static esp_err_t onoff_put_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    char body[MAX_POST_BODY + 1];
+    if (recv_body(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad JSON");
+        return ESP_FAIL;
+    }
+    cJSON *on_j = cJSON_GetObjectItemCaseSensitive(root, "on");
+    if (!cJSON_IsBool(on_j)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing on");
+        return ESP_FAIL;
+    }
+    bool on = cJSON_IsTrue(on_j);
+    cJSON_Delete(root);
+
+    esp_err_t err = matter_controller_set_onoff(node_id, on);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to set OnOff state");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{}");
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/nodes
 // ---------------------------------------------------------------------------
 
@@ -560,6 +662,9 @@ esp_err_t web_server_start(void)
     const httpd_uri_t factory_reset      = {.uri = "/api/factory-reset",   .method = HTTP_POST,   .handler = factory_reset_post_handler};
     const httpd_uri_t devices_get        = {.uri = "/api/devices",         .method = HTTP_GET,    .handler = devices_get_handler};
     const httpd_uri_t device_delete      = {.uri = "/api/devices/*",       .method = HTTP_DELETE, .handler = device_delete_handler};
+    const httpd_uri_t reinterview_post   = {.uri = "/api/reinterview/*",   .method = HTTP_POST,   .handler = reinterview_post_handler};
+    const httpd_uri_t onoff_get          = {.uri = "/api/onoff/*",         .method = HTTP_GET,    .handler = onoff_get_handler};
+    const httpd_uri_t onoff_put          = {.uri = "/api/onoff/*",         .method = HTTP_PUT,    .handler = onoff_put_handler};
     const httpd_uri_t nodes_get          = {.uri = "/api/nodes",           .method = HTTP_GET,    .handler = nodes_get_handler};
     const httpd_uri_t node_put           = {.uri = "/api/nodes/*",         .method = HTTP_PUT,    .handler = node_put_handler};
     const httpd_uri_t node_delete        = {.uri = "/api/nodes/*",         .method = HTTP_DELETE, .handler = node_delete_handler};
@@ -577,6 +682,9 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &factory_reset);
     httpd_register_uri_handler(server, &devices_get);
     httpd_register_uri_handler(server, &device_delete);
+    httpd_register_uri_handler(server, &reinterview_post);
+    httpd_register_uri_handler(server, &onoff_get);
+    httpd_register_uri_handler(server, &onoff_put);
     httpd_register_uri_handler(server, &nodes_get);
     httpd_register_uri_handler(server, &node_put);
     httpd_register_uri_handler(server, &node_delete);

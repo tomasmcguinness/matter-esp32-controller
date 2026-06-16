@@ -7,6 +7,8 @@ const DEVICE_TYPE_NAMES: Record<number, string> = {
   0x0100: 'On/Off Light',
   0x0101: 'Dimmable Light',
   0x010a: 'On/Off Plug',
+  0x010c: 'Color Temperature Light',
+  0x010d: 'Extended Color Light',
   0x0302: 'Temperature Sensor',
 }
 
@@ -14,10 +16,17 @@ export function deviceTypeName(id: number): string {
   return DEVICE_TYPE_NAMES[id] ?? `0x${id.toString(16).toUpperCase()}`
 }
 
+export function isOnOffDevice(id: number): boolean {
+  return id === 0x0100 || id === 0x0101 || id === 0x010a ||
+         id === 0x010c || id === 0x010d
+}
+
 export function deviceTypeIcon(id: number): string {
   switch (id) {
     case 0x0100: return '💡'
     case 0x0101: return '💡'
+    case 0x010c: return '💡'
+    case 0x010d: return '💡'
     case 0x010a: return '🔌'
     default: return '📦'
   }

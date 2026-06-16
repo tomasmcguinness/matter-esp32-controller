@@ -27,7 +27,24 @@ let devices: CommissionedDevice[] = [
     productName: 'Energy Plug',
     deviceType: 0x010a,
   },
+  {
+    nodeId: 0x2002,
+    vendorName: 'Nanoleaf',
+    productName: 'Essentials Bulb',
+    deviceType: 0x010d,
+  },
 ]
+
+// Seed the canvas with the mock devices so On/Off switches are visible in dev.
+nodeConfigs = devices.map((d, i) => ({
+  id: String(d.nodeId),
+  x: 80 + 200 * (i % 4),
+  y: 80 + 160 * Math.floor(i / 4),
+  settings: { label: `Node 0x${d.nodeId.toString(16).toUpperCase()}`, nodeId: d.nodeId, deviceType: d.deviceType },
+}))
+
+// Mock OnOff state per node id.
+const onoffState: Record<number, boolean> = {}
 
 let threadCredentials: ThreadCredentials = { hasCredentials: false }
 
@@ -64,6 +81,28 @@ export const handlers = [
   http.delete('/api/devices/:nodeId', ({ params }) => {
     const nodeId = Number(params.nodeId)
     devices = devices.filter(d => d.nodeId !== nodeId)
+    return HttpResponse.json({})
+  }),
+
+  http.post('/api/reinterview/:nodeId', async ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    // Simulate the device being re-read; just confirm it still exists.
+    if (!devices.some(d => d.nodeId === nodeId)) {
+      return new HttpResponse('Not found', { status: 404 })
+    }
+    await new Promise(resolve => setTimeout(resolve, 600))
+    return HttpResponse.json({})
+  }),
+
+  http.get('/api/onoff/:nodeId', ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    return HttpResponse.json({ on: onoffState[nodeId] ?? false })
+  }),
+
+  http.put('/api/onoff/:nodeId', async ({ params, request }) => {
+    const nodeId = Number(params.nodeId)
+    const body = (await request.json()) as { on: boolean }
+    onoffState[nodeId] = !!body.on
     return HttpResponse.json({})
   }),
 

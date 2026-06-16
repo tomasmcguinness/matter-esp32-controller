@@ -12,13 +12,78 @@ import {
   Handle,
   Position,
 } from '@xyflow/react'
-import { useCallback, useEffect, useRef } from 'react'
-import { deviceTypeName, deviceTypeIcon } from './deviceTypeName'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { deviceTypeName, deviceTypeIcon, isOnOffDevice } from './deviceTypeName'
 
 type DeviceNodeData = {
   label: string
   nodeId: number
   deviceType: number
+}
+
+function OnOffSwitch({ nodeId }: { nodeId: number }) {
+  // null = loading/unknown, true/false = known state
+  const [on, setOn] = useState<boolean | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`/api/onoff/${nodeId}`)
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then((d: { on: boolean }) => { if (!cancelled) setOn(!!d.on) })
+      .catch(() => { if (!cancelled) setOn(null) })
+    return () => { cancelled = true }
+  }, [nodeId])
+
+  const toggle = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (busy) return
+    const next = !(on ?? false)
+    const prev = on
+    setOn(next)
+    setBusy(true)
+    fetch(`/api/onoff/${nodeId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: next }),
+    })
+      .then(r => { if (!r.ok) throw new Error() })
+      .catch(() => setOn(prev))
+      .finally(() => setBusy(false))
+  }, [nodeId, on, busy])
+
+  const known = on !== null
+  return (
+    <button
+      className="nodrag"
+      onClick={toggle}
+      title={on ? 'On' : 'Off'}
+      style={{
+        marginTop: 6,
+        width: 40,
+        height: 22,
+        borderRadius: 11,
+        border: 'none',
+        padding: 0,
+        cursor: 'pointer',
+        position: 'relative',
+        background: on ? '#16a34a' : '#cbd5e1',
+        opacity: known ? 1 : 0.5,
+        transition: 'background 0.15s',
+      }}
+    >
+      <span style={{
+        position: 'absolute',
+        top: 2,
+        left: on ? 20 : 2,
+        width: 18,
+        height: 18,
+        borderRadius: '50%',
+        background: '#fff',
+        transition: 'left 0.15s',
+      }} />
+    </button>
+  )
 }
 
 function DeviceNode({ data }: { data: DeviceNodeData }) {
@@ -47,6 +112,7 @@ function DeviceNode({ data }: { data: DeviceNodeData }) {
             Node 0x{data.nodeId.toString(16).toUpperCase()}
           </div>
           <div style={{ color: '#475569', marginTop: 2 }}>{typeName}</div>
+          {isOnOffDevice(data.deviceType) && <OnOffSwitch nodeId={data.nodeId} />}
         </div>
       </div>
       <Handle type="source" position={Position.Right} id="binding-source" />
