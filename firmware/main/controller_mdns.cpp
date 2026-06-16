@@ -3,7 +3,6 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "lwip/ip6_addr.h"
 #include "mdns.h"
 
 static const char *TAG = "controller_mdns";
@@ -76,48 +75,4 @@ esp_err_t controller_mdns_start(void)
     }
 
     return ESP_OK;
-}
-
-void controller_mdns_probe_commissionable(uint32_t timeout_ms)
-{
-    esp_err_t err = mdns_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "probe: mdns_init failed: 0x%x", err);
-        return;
-    }
-
-    ESP_LOGI(TAG, "probe: browsing _matterc._udp for %u ms ...", timeout_ms);
-    mdns_result_t *results = nullptr;
-    err = mdns_query_ptr("_matterc", "_udp", timeout_ms, 20, &results);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "probe: mdns_query_ptr failed: 0x%x", err);
-        return;
-    }
-
-    size_t count = 0;
-    for (mdns_result_t *r = results; r != nullptr; r = r->next, count++) {
-        const char *ifkey = r->esp_netif ? esp_netif_get_ifkey(r->esp_netif) : "(null)";
-        ESP_LOGI(TAG, "probe: result[%u] instance='%s' host='%s' port=%u iface=%s",
-                 (unsigned)count,
-                 r->instance_name ? r->instance_name : "(null)",
-                 r->hostname ? r->hostname : "(null)",
-                 r->port,
-                 ifkey ? ifkey : "(null)");
-        for (mdns_ip_addr_t *a = r->addr; a != nullptr; a = a->next) {
-            char ip[46] = {0};
-            if (a->addr.type == ESP_IPADDR_TYPE_V4)
-                esp_ip4addr_ntoa(&a->addr.u_addr.ip4, ip, sizeof(ip));
-            else
-                ip6addr_ntoa_r((const ip6_addr_t *)&a->addr.u_addr.ip6, ip, sizeof(ip));
-            ESP_LOGI(TAG, "probe:   addr %s (%s)", ip,
-                     a->addr.type == ESP_IPADDR_TYPE_V4 ? "v4" : "v6");
-        }
-        for (size_t t = 0; t < r->txt_count; t++) {
-            ESP_LOGI(TAG, "probe:   txt %s=%s",
-                     r->txt[t].key ? r->txt[t].key : "",
-                     r->txt[t].value ? r->txt[t].value : "");
-        }
-    }
-    ESP_LOGI(TAG, "probe: %u commissionable node(s) seen via mDNS", (unsigned)count);
-    mdns_query_results_free(results);
 }

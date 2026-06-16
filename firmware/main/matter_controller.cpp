@@ -13,7 +13,6 @@
 
 #include "ws_server.h"
 #include "cJSON.h"
-#include "controller_mdns.h"
 #include "device_manager.h"
 #include "node_manager.h"
 #include "pairing_command.h"
@@ -412,10 +411,6 @@ esp_err_t matter_controller_commission_on_network(const char *onboarding_payload
     esp_matter::controller::pairing_command::get_instance().set_callbacks(callbacks);
 
     ESP_LOGI(TAG, "Attempting to commission node %llu", node_id);
-
-    // Diagnostic: confirm the ESP32's own mDNS can see the commissionable node on
-    // the Ethernet link before handing off to the CHIP discovery layer.
-    controller_mdns_probe_commissionable(5000);
 
     // TODO(thread): when commissioning a Thread device (no on-network path
     // available), switch to a BLE->Thread pairing flow and attach the shared
