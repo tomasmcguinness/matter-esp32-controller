@@ -123,10 +123,10 @@ static esp_err_t controller_commission_post_handler(httpd_req_t *req)
     payload[sizeof(payload) - 1] = '\0';
     cJSON_Delete(root);
 
-    ESP_LOGI(TAG, "Beginning BLE+Wi-Fi commissioning: %s", payload);
+    ESP_LOGI(TAG, "Beginning on-network commissioning: %s", payload);
 
     uint64_t commissioned_node_id = 0;
-    esp_err_t err = matter_controller_commission_ble_wifi(payload, &commissioned_node_id);
+    esp_err_t err = matter_controller_commission_on_network(payload, &commissioned_node_id);
 
     if (err == ESP_ERR_INVALID_ARG) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid onboarding payload");
