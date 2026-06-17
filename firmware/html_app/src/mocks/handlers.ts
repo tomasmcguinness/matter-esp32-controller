@@ -4,9 +4,11 @@ import type { ThreadCredentials, BorderAgent } from '../Thread'
 
 type NodeConfig = { id: string; x: number; y: number; settings: Record<string, unknown> }
 type EdgeConfig = { id: string; source: string; target: string; sourceHandle?: string; targetHandle?: string }
+type BindingConfig = { switchNodeId: number; lightNodeId: number }
 
 let nodeConfigs: NodeConfig[] = []
 let edgeConfigs: EdgeConfig[] = []
+let bindings: BindingConfig[] = []
 
 let devices: CommissionedDevice[] = [
   {
@@ -32,6 +34,12 @@ let devices: CommissionedDevice[] = [
     vendorName: 'Nanoleaf',
     productName: 'Essentials Bulb',
     deviceType: 0x010d,
+  },
+  {
+    nodeId: 0x2003,
+    vendorName: 'Aqara',
+    productName: 'Wireless Switch',
+    deviceType: 0x0103,
   },
 ]
 
@@ -142,6 +150,24 @@ export const handlers = [
     const id = params.edgeId as string
     edgeConfigs = edgeConfigs.filter(e => e.id !== id)
     return HttpResponse.json({})
+  }),
+
+  http.post('/api/bindings', async ({ request }) => {
+    const body = (await request.json()) as BindingConfig
+    if (typeof body?.switchNodeId !== 'number' || typeof body?.lightNodeId !== 'number') {
+      return new HttpResponse('Missing switchNodeId/lightNodeId', { status: 400 })
+    }
+    const exists = bindings.some(b => b.switchNodeId === body.switchNodeId && b.lightNodeId === body.lightNodeId)
+    if (!exists) bindings.push({ switchNodeId: body.switchNodeId, lightNodeId: body.lightNodeId })
+    console.log('[mock] bind switch', body.switchNodeId.toString(16), '-> light', body.lightNodeId.toString(16))
+    return HttpResponse.json({ ok: true })
+  }),
+
+  http.delete('/api/bindings', async ({ request }) => {
+    const body = (await request.json()) as BindingConfig
+    bindings = bindings.filter(b => !(b.switchNodeId === body.switchNodeId && b.lightNodeId === body.lightNodeId))
+    console.log('[mock] unbind switch', body.switchNodeId?.toString(16), '-> light', body.lightNodeId?.toString(16))
+    return HttpResponse.json({ ok: true })
   }),
 
   http.get('/api/thread/credentials', () => {

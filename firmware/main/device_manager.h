@@ -31,6 +31,8 @@ char     *device_manager_get_all_json(void); // caller must free
 size_t    device_manager_get_electrical_sensor_endpoints(uint64_t *node_ids, uint16_t *endpoint_ids, size_t max);
 // Returns the first endpoint hosting an On/Off device type (0x0100/0x0101/0x010a).
 esp_err_t device_manager_get_onoff_endpoint(uint64_t node_id, uint16_t *endpoint_out);
+// Returns the first endpoint hosting a switch device type (0x0103/0x0104/0x0105/0x000f).
+esp_err_t device_manager_get_switch_endpoint(uint64_t node_id, uint16_t *endpoint_out);
 esp_err_t device_manager_remove_device(uint64_t node_id);
 esp_err_t device_manager_persist(void);
 esp_err_t device_manager_clear(void);

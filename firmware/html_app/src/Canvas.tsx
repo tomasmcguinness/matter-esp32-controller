@@ -13,7 +13,7 @@ import {
   Position,
 } from '@xyflow/react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { deviceTypeName, deviceTypeIcon, isOnOffDevice } from './deviceTypeName'
+import { deviceTypeName, deviceTypeIcon, isOnOffDevice, isSwitchDevice } from './deviceTypeName'
 
 type DeviceNodeData = {
   label: string
@@ -131,6 +131,37 @@ function Canvas() {
   const [edges, setEdges, onEdgesChangeBase] = useEdgesState<Edge>([])
   const nodeIdCounter = useRef(10)
 
+  // Always-current refs so edge/connect callbacks can resolve node device types.
+  const nodesRef = useRef<Node[]>([])
+  const edgesRef = useRef<Edge[]>([])
+  nodesRef.current = nodes
+  edgesRef.current = edges
+
+  // Returns the Matter binding body if the edge connects a switch (source) to a
+  // bindable light (target), otherwise null (the edge stays purely visual).
+  const bindingBodyFor = useCallback((sourceId: string, targetId: string) => {
+    const src = nodesRef.current.find(n => n.id === sourceId)
+    const tgt = nodesRef.current.find(n => n.id === targetId)
+    const srcType = src?.data?.deviceType as number | undefined
+    const tgtType = tgt?.data?.deviceType as number | undefined
+    if (srcType === undefined || tgtType === undefined) return null
+    if (!isSwitchDevice(srcType) || !isOnOffDevice(tgtType)) return null
+    return {
+      switchNodeId: src!.data!.nodeId as number,
+      lightNodeId: tgt!.data!.nodeId as number,
+    }
+  }, [])
+
+  const deleteBinding = useCallback((sourceId: string, targetId: string) => {
+    const body = bindingBodyFor(sourceId, targetId)
+    if (!body) return
+    fetch('/api/bindings', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => { })
+  }, [bindingBodyFor])
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Delete' && e.key !== 'Backspace') return
@@ -141,7 +172,10 @@ function Canvas() {
         if (deletedIds.size === 0) return nds
         setEdges(eds => {
           const removed = eds.filter(e => deletedIds.has(e.source) || deletedIds.has(e.target))
-          removed.forEach(e => fetch(`/api/edges/${e.id}`, { method: 'DELETE' }).catch(() => { }))
+          removed.forEach(e => {
+            fetch(`/api/edges/${e.id}`, { method: 'DELETE' }).catch(() => { })
+            deleteBinding(e.source, e.target)
+          })
           return eds.filter(e => !deletedIds.has(e.source) && !deletedIds.has(e.target))
         })
         for (const id of deletedIds) {
@@ -152,7 +186,7 @@ function Canvas() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [setNodes, setEdges])
+  }, [setNodes, setEdges, deleteBinding])
 
   const onNodeDragStop = useCallback((_: React.MouseEvent, node: Node) => {
     fetch(`/api/nodes/${node.id}`, {
@@ -164,10 +198,13 @@ function Canvas() {
 
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
     changes.filter(c => c.type === 'remove').forEach(c => {
-      fetch(`/api/edges/${(c as { id: string }).id}`, { method: 'DELETE' }).catch(() => { })
+      const id = (c as { id: string }).id
+      fetch(`/api/edges/${id}`, { method: 'DELETE' }).catch(() => { })
+      const edge = edgesRef.current.find(e => e.id === id)
+      if (edge) deleteBinding(edge.source, edge.target)
     })
     onEdgesChangeBase(changes)
-  }, [onEdgesChangeBase])
+  }, [onEdgesChangeBase, deleteBinding])
 
   const onConnect = useCallback((params: { source: string; sourceHandle?: string | null; target: string; targetHandle?: string | null }) => {
     const edgeId = [params.source, params.sourceHandle, params.target, params.targetHandle].filter(Boolean).join('-')
@@ -184,7 +221,17 @@ function Canvas() {
         targetHandle: params.targetHandle ?? null,
       }),
     }).catch(() => { })
-  }, [setEdges])
+
+    // If a switch was connected to a light, create the Matter binding too.
+    const binding = bindingBodyFor(params.source, params.target)
+    if (binding) {
+      fetch('/api/bindings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(binding),
+      }).catch(() => { })
+    }
+  }, [setEdges, bindingBodyFor])
 
   const onInit = useCallback(() => {
     fetch('/api/nodes')

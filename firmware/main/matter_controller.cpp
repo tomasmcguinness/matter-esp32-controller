@@ -11,6 +11,7 @@
 #include <esp_matter_controller_cluster_command.h>
 #include <esp_matter_controller_pairing_command.h>
 #include <esp_matter_controller_read_command.h>
+#include <esp_matter_controller_write_command.h>
 
 #include "ws_server.h"
 #include "cJSON.h"
@@ -35,7 +36,9 @@
 #include <setup_payload/QRCodeSetupPayloadParser.h>
 #include <setup_payload/SetupPayload.h>
 
+#include <algorithm>
 #include <map>
+#include <string>
 #include <vector>
 
 using namespace chip;
@@ -61,6 +64,19 @@ static constexpr uint32_t kOnOffCluster          = 0x0006;
 static constexpr uint32_t kOnOffAttribute        = 0x0000;
 static constexpr uint32_t kOnOffCmdOff           = 0x00;
 static constexpr uint32_t kOnOffCmdOn            = 0x01;
+
+// Binding / Access Control clusters used for switch->light bindings.
+static constexpr uint32_t kBindingCluster        = 0x001E;
+static constexpr uint32_t kBindingAttribute      = 0x0000;
+static constexpr uint32_t kAclCluster            = 0x001F;
+static constexpr uint32_t kAclAttribute          = 0x0000;
+// Operational node id of this controller (commissioner), see init(112233, 1, 5580) below.
+// This is the subject of the Administer ACL entry every commissioned device already holds.
+static constexpr uint64_t kControllerNodeId      = 112233ULL;
+// AccessControlEntryPrivilegeEnum / AccessControlEntryAuthModeEnum values.
+static constexpr uint8_t  kAclPrivilegeOperate   = 3;
+static constexpr uint8_t  kAclPrivilegeAdminister = 5;
+static constexpr uint8_t  kAclAuthModeCase       = 2;
 
 // ---------------------------------------------------------------------------
 // Node ID counter (NVS)
@@ -410,6 +426,296 @@ esp_err_t matter_controller_set_onoff(uint64_t node_id, bool on)
     if (err != ESP_OK)
         ESP_LOGE(TAG, "OnOff command failed for node 0x%llx: 0x%x", (unsigned long long)node_id, err);
     return err;
+}
+
+// ---------------------------------------------------------------------------
+// Binding (switch -> light) via Binding + Access Control clusters
+// ---------------------------------------------------------------------------
+
+struct binding_target_t {
+    uint64_t node;
+    uint16_t endpoint;
+    uint32_t cluster;
+};
+
+static SemaphoreHandle_t s_rmw_read_done = nullptr;
+static bool s_rmw_read_ok = false;
+static std::vector<binding_target_t> s_binding_entries;
+static std::vector<uint64_t> s_acl_operate_subjects;
+
+static void on_rmw_read_done(uint64_t,
+                             const chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> &,
+                             const chip::Platform::ScopedMemoryBufferWithSize<chip::app::EventPathParams> &)
+{
+    if (s_rmw_read_done)
+        xSemaphoreGive(s_rmw_read_done);
+}
+
+// Captures the existing unicast Binding targets on the switch endpoint.
+static void on_binding_read_attr(uint64_t,
+                                 const chip::app::ConcreteDataAttributePath &path,
+                                 chip::TLV::TLVReader *data)
+{
+    if (!data || path.mClusterId != kBindingCluster || path.mAttributeId != kBindingAttribute)
+        return;
+    s_binding_entries.clear();
+    chip::TLV::TLVType list_type;
+    if (data->EnterContainer(list_type) != CHIP_NO_ERROR)
+        return;
+    while (data->Next() == CHIP_NO_ERROR) {
+        chip::TLV::TLVType struct_type;
+        if (data->EnterContainer(struct_type) != CHIP_NO_ERROR)
+            continue;
+        binding_target_t t = {0, 0, 0};
+        bool has_ep = false, has_cluster = false;
+        while (data->Next() == CHIP_NO_ERROR) {
+            uint32_t tag = chip::TLV::TagNumFromTag(data->GetTag());
+            if (tag == 1) data->Get(t.node);                                  // Node
+            else if (tag == 3) has_ep = (data->Get(t.endpoint) == CHIP_NO_ERROR);   // Endpoint
+            else if (tag == 4) has_cluster = (data->Get(t.cluster) == CHIP_NO_ERROR); // Cluster
+        }
+        data->ExitContainer(struct_type);
+        if (has_ep && has_cluster)  // unicast binding only (skip group bindings)
+            s_binding_entries.push_back(t);
+    }
+    data->ExitContainer(list_type);
+    s_rmw_read_ok = true;
+}
+
+// Captures the subjects of existing Operate/CASE ACL entries on the light.
+static void on_acl_read_attr(uint64_t,
+                             const chip::app::ConcreteDataAttributePath &path,
+                             chip::TLV::TLVReader *data)
+{
+    if (!data || path.mClusterId != kAclCluster || path.mAttributeId != kAclAttribute)
+        return;
+    s_acl_operate_subjects.clear();
+    chip::TLV::TLVType list_type;
+    if (data->EnterContainer(list_type) != CHIP_NO_ERROR)
+        return;
+    while (data->Next() == CHIP_NO_ERROR) {
+        chip::TLV::TLVType struct_type;
+        if (data->EnterContainer(struct_type) != CHIP_NO_ERROR)
+            continue;
+        uint8_t privilege = 0, auth_mode = 0;
+        std::vector<uint64_t> subjects;
+        while (data->Next() == CHIP_NO_ERROR) {
+            uint32_t tag = chip::TLV::TagNumFromTag(data->GetTag());
+            if (tag == 1) data->Get(privilege);        // Privilege
+            else if (tag == 2) data->Get(auth_mode);   // AuthMode
+            else if (tag == 3 && data->GetType() == chip::TLV::kTLVType_Array) { // Subjects
+                chip::TLV::TLVType subj_type;
+                if (data->EnterContainer(subj_type) == CHIP_NO_ERROR) {
+                    while (data->Next() == CHIP_NO_ERROR) {
+                        uint64_t subj = 0;
+                        if (data->Get(subj) == CHIP_NO_ERROR)
+                            subjects.push_back(subj);
+                    }
+                    data->ExitContainer(subj_type);
+                }
+            }
+        }
+        data->ExitContainer(struct_type);
+        if (privilege == kAclPrivilegeOperate && auth_mode == kAclAuthModeCase) {
+            for (uint64_t s : subjects)
+                if (std::find(s_acl_operate_subjects.begin(), s_acl_operate_subjects.end(), s) ==
+                    s_acl_operate_subjects.end())
+                    s_acl_operate_subjects.push_back(s);
+        }
+    }
+    data->ExitContainer(list_type);
+    s_rmw_read_ok = true;
+}
+
+static esp_err_t blocking_read_attr(uint64_t node_id, uint16_t endpoint_id, uint32_t cluster_id,
+                                    uint32_t attribute_id,
+                                    esp_matter::controller::attribute_report_cb_t attr_cb)
+{
+    if (!s_rmw_read_done) {
+        s_rmw_read_done = xSemaphoreCreateBinary();
+        if (!s_rmw_read_done)
+            return ESP_ERR_NO_MEM;
+    }
+    s_rmw_read_ok = false;
+
+    chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> attr_paths;
+    chip::Platform::ScopedMemoryBufferWithSize<chip::app::EventPathParams> event_paths;
+    attr_paths.Alloc(1);
+    if (!attr_paths.Get())
+        return ESP_ERR_NO_MEM;
+    attr_paths[0] = chip::app::AttributePathParams(endpoint_id, cluster_id, attribute_id);
+
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    auto *cmd = new esp_matter::controller::read_command(
+        node_id, std::move(attr_paths), std::move(event_paths),
+        attr_cb, on_rmw_read_done, nullptr);
+    if (cmd)
+        cmd->send_command();
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+
+    if (!cmd)
+        return ESP_ERR_NO_MEM;
+
+    if (xSemaphoreTake(s_rmw_read_done, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Attribute read timed out for node 0x%llx", (unsigned long long)node_id);
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!s_rmw_read_ok)
+        return ESP_FAIL;
+    return ESP_OK;
+}
+
+static esp_err_t blocking_write_attr(uint64_t node_id, uint16_t endpoint_id, uint32_t cluster_id,
+                                     uint32_t attribute_id, const char *json_value)
+{
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    esp_err_t err = esp_matter::controller::send_write_attr_command(
+        node_id, endpoint_id, cluster_id, attribute_id, json_value, chip::NullOptional);
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "Write attr failed node 0x%llx cluster 0x%lx: 0x%x",
+                 (unsigned long long)node_id, (unsigned long)cluster_id, err);
+    return err;
+}
+
+// Builds the json_to_tlv value for the light's ACL: a fixed controller Administer entry plus
+// (when any switches are bound) a single Operate entry listing all switch subjects. The
+// Administer entry is reconstructed (not copied) so the controller can never lock itself out.
+static std::string build_acl_json(uint64_t controller_node_id, const std::vector<uint64_t> &operate_subjects)
+{
+    char buf[96];
+    std::string json = "{\"0:ARR-OBJ\":[";
+    snprintf(buf, sizeof(buf),
+             "{\"1:U8\":%u,\"2:U8\":%u,\"3:ARR-U64\":[\"%llu\"],\"4:NULL\":null}",
+             (unsigned)kAclPrivilegeAdminister, (unsigned)kAclAuthModeCase,
+             (unsigned long long)controller_node_id);
+    json += buf;
+    if (!operate_subjects.empty()) {
+        snprintf(buf, sizeof(buf), ",{\"1:U8\":%u,\"2:U8\":%u,\"3:ARR-U64\":[",
+                 (unsigned)kAclPrivilegeOperate, (unsigned)kAclAuthModeCase);
+        json += buf;
+        for (size_t i = 0; i < operate_subjects.size(); ++i) {
+            snprintf(buf, sizeof(buf), "%s\"%llu\"", i ? "," : "",
+                     (unsigned long long)operate_subjects[i]);
+            json += buf;
+        }
+        json += "],\"4:NULL\":null}";
+    }
+    json += "]}";
+    return json;
+}
+
+static std::string build_binding_json(const std::vector<binding_target_t> &targets)
+{
+    char buf[128];
+    std::string json = "{\"0:ARR-OBJ\":[";
+    for (size_t i = 0; i < targets.size(); ++i) {
+        snprintf(buf, sizeof(buf),
+                 "%s{\"1:U64\":\"%llu\",\"3:U16\":%u,\"4:U32\":%lu}",
+                 i ? "," : "", (unsigned long long)targets[i].node,
+                 (unsigned)targets[i].endpoint, (unsigned long)targets[i].cluster);
+        json += buf;
+    }
+    json += "]}";
+    return json;
+}
+
+esp_err_t matter_controller_create_binding(uint64_t switch_node_id, uint16_t switch_endpoint,
+                                           uint64_t light_node_id, uint16_t light_endpoint)
+{
+    esp_err_t err;
+    if (switch_endpoint == 0) {
+        err = device_manager_get_switch_endpoint(switch_node_id, &switch_endpoint);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "No switch endpoint for node 0x%llx", (unsigned long long)switch_node_id);
+            return err;
+        }
+    }
+    if (light_endpoint == 0) {
+        err = device_manager_get_onoff_endpoint(light_node_id, &light_endpoint);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "No OnOff endpoint for node 0x%llx", (unsigned long long)light_node_id);
+            return err;
+        }
+    }
+
+    // 1. Grant the switch Operate access on the light's ACL (read-modify-write, preserving the
+    //    controller's Administer entry). Done before the binding so the switch's first command
+    //    is already authorized.
+    err = blocking_read_attr(light_node_id, 0, kAclCluster, kAclAttribute, on_acl_read_attr);
+    if (err != ESP_OK)
+        return err;
+    std::vector<uint64_t> subjects = s_acl_operate_subjects;
+    if (std::find(subjects.begin(), subjects.end(), switch_node_id) == subjects.end())
+        subjects.push_back(switch_node_id);
+    std::string acl_json = build_acl_json(kControllerNodeId, subjects);
+    err = blocking_write_attr(light_node_id, 0, kAclCluster, kAclAttribute, acl_json.c_str());
+    if (err != ESP_OK)
+        return err;
+
+    // 2. Add the light as a binding target on the switch (read-modify-write so existing bindings
+    //    on the switch endpoint are preserved).
+    err = blocking_read_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
+                             on_binding_read_attr);
+    if (err != ESP_OK)
+        return err;
+    std::vector<binding_target_t> targets = s_binding_entries;
+    bool exists = false;
+    for (const auto &t : targets)
+        if (t.node == light_node_id && t.endpoint == light_endpoint && t.cluster == kOnOffCluster)
+            { exists = true; break; }
+    if (!exists)
+        targets.push_back({light_node_id, light_endpoint, kOnOffCluster});
+    std::string binding_json = build_binding_json(targets);
+    err = blocking_write_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
+                              binding_json.c_str());
+    if (err != ESP_OK)
+        return err;
+
+    ESP_LOGI(TAG, "Created binding switch 0x%llx ep%u -> light 0x%llx ep%u",
+             (unsigned long long)switch_node_id, switch_endpoint,
+             (unsigned long long)light_node_id, light_endpoint);
+    return ESP_OK;
+}
+
+esp_err_t matter_controller_delete_binding(uint64_t switch_node_id, uint16_t switch_endpoint,
+                                           uint64_t light_node_id, uint16_t light_endpoint)
+{
+    if (switch_endpoint == 0 &&
+        device_manager_get_switch_endpoint(switch_node_id, &switch_endpoint) != ESP_OK)
+        return ESP_ERR_NOT_FOUND;
+    if (light_endpoint == 0)
+        device_manager_get_onoff_endpoint(light_node_id, &light_endpoint);  // best effort
+
+    // 1. Remove the light target from the switch's Binding list.
+    if (blocking_read_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
+                           on_binding_read_attr) == ESP_OK) {
+        std::vector<binding_target_t> targets;
+        for (const auto &t : s_binding_entries) {
+            bool match = t.node == light_node_id && t.cluster == kOnOffCluster &&
+                         (light_endpoint == 0 || t.endpoint == light_endpoint);
+            if (!match)
+                targets.push_back(t);
+        }
+        std::string binding_json = build_binding_json(targets);
+        blocking_write_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
+                            binding_json.c_str());
+    }
+
+    // 2. Remove the switch subject from the light's ACL Operate entry (always keep the controller
+    //    Administer entry).
+    if (blocking_read_attr(light_node_id, 0, kAclCluster, kAclAttribute, on_acl_read_attr) == ESP_OK) {
+        std::vector<uint64_t> subjects;
+        for (uint64_t s : s_acl_operate_subjects)
+            if (s != switch_node_id)
+                subjects.push_back(s);
+        std::string acl_json = build_acl_json(kControllerNodeId, subjects);
+        blocking_write_attr(light_node_id, 0, kAclCluster, kAclAttribute, acl_json.c_str());
+    }
+
+    ESP_LOGI(TAG, "Deleted binding switch 0x%llx -> light 0x%llx",
+             (unsigned long long)switch_node_id, (unsigned long long)light_node_id);
+    return ESP_OK;
 }
 
 // ---------------------------------------------------------------------------

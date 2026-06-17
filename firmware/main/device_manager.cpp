@@ -338,6 +338,10 @@ static constexpr uint32_t kDevTypeDimmableLight   = 0x0101;
 static constexpr uint32_t kDevTypeOnOffPlug       = 0x010A;
 static constexpr uint32_t kDevTypeColorTempLight  = 0x010C;
 static constexpr uint32_t kDevTypeExtColorLight   = 0x010D;
+static constexpr uint32_t kDevTypeGenericSwitch   = 0x000F;
+static constexpr uint32_t kDevTypeOnOffSwitch     = 0x0103;
+static constexpr uint32_t kDevTypeDimmerSwitch    = 0x0104;
+static constexpr uint32_t kDevTypeColorDimmerSwitch = 0x0105;
 
 esp_err_t device_manager_get_onoff_endpoint(uint64_t node_id, uint16_t *endpoint_out)
 {
@@ -350,6 +354,29 @@ esp_err_t device_manager_get_onoff_endpoint(uint64_t node_id, uint16_t *endpoint
             for (auto dt : ep.device_types) {
                 if (dt == kDevTypeOnOffLight || dt == kDevTypeDimmableLight || dt == kDevTypeOnOffPlug ||
                     dt == kDevTypeColorTempLight || dt == kDevTypeExtColorLight) {
+                    *endpoint_out = ep.endpoint_id;
+                    err = ESP_OK;
+                    break;
+                }
+            }
+            if (err == ESP_OK) break;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    return err;
+}
+
+esp_err_t device_manager_get_switch_endpoint(uint64_t node_id, uint16_t *endpoint_out)
+{
+    if (!endpoint_out) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    auto *dev = find_device(node_id);
+    if (dev) {
+        for (const auto &ep : dev->endpoints) {
+            for (auto dt : ep.device_types) {
+                if (dt == kDevTypeOnOffSwitch || dt == kDevTypeDimmerSwitch ||
+                    dt == kDevTypeColorDimmerSwitch || dt == kDevTypeGenericSwitch) {
                     *endpoint_out = ep.endpoint_id;
                     err = ESP_OK;
                     break;

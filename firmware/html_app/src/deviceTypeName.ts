@@ -9,6 +9,9 @@ const DEVICE_TYPE_NAMES: Record<number, string> = {
   0x010a: 'On/Off Plug',
   0x010c: 'Color Temperature Light',
   0x010d: 'Extended Color Light',
+  0x0103: 'On/Off Light Switch',
+  0x0104: 'Dimmer Switch',
+  0x0105: 'Color Dimmer Switch',
   0x0302: 'Temperature Sensor',
 }
 
@@ -21,6 +24,10 @@ export function isOnOffDevice(id: number): boolean {
          id === 0x010c || id === 0x010d
 }
 
+export function isSwitchDevice(id: number): boolean {
+  return id === 0x0103 || id === 0x0104 || id === 0x0105
+}
+
 export function deviceTypeIcon(id: number): string {
   switch (id) {
     case 0x0100: return '💡'
@@ -28,6 +35,9 @@ export function deviceTypeIcon(id: number): string {
     case 0x010c: return '💡'
     case 0x010d: return '💡'
     case 0x010a: return '🔌'
+    case 0x0103: return '🎚️'
+    case 0x0104: return '🎚️'
+    case 0x0105: return '🎚️'
     default: return '📦'
   }
 }

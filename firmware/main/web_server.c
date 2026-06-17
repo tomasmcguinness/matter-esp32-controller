@@ -462,6 +462,65 @@ static esp_err_t edge_delete_handler(httpd_req_t *req)
 }
 
 // ---------------------------------------------------------------------------
+// POST/DELETE /api/bindings
+//   body { "switchNodeId": N, "lightNodeId": N, "switchEndpoint"?: N, "lightEndpoint"?: N }
+// Creates/removes a Matter binding so the switch directly controls the light.
+// ---------------------------------------------------------------------------
+
+static esp_err_t bindings_request_handler(httpd_req_t *req, bool create)
+{
+    char body[MAX_POST_BODY + 1];
+    if (recv_body(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad JSON");
+        return ESP_FAIL;
+    }
+    cJSON *sw_j  = cJSON_GetObjectItemCaseSensitive(root, "switchNodeId");
+    cJSON *lt_j  = cJSON_GetObjectItemCaseSensitive(root, "lightNodeId");
+    if (!cJSON_IsNumber(sw_j) || !cJSON_IsNumber(lt_j)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing switchNodeId/lightNodeId");
+        return ESP_FAIL;
+    }
+    cJSON *swe_j = cJSON_GetObjectItemCaseSensitive(root, "switchEndpoint");
+    cJSON *lte_j = cJSON_GetObjectItemCaseSensitive(root, "lightEndpoint");
+
+    uint64_t switch_node = (uint64_t)sw_j->valuedouble;
+    uint64_t light_node  = (uint64_t)lt_j->valuedouble;
+    uint16_t switch_ep   = cJSON_IsNumber(swe_j) ? (uint16_t)swe_j->valuedouble : 0;  // 0 = auto-resolve
+    uint16_t light_ep    = cJSON_IsNumber(lte_j) ? (uint16_t)lte_j->valuedouble : 0;
+    cJSON_Delete(root);
+
+    esp_err_t err = create
+        ? matter_controller_create_binding(switch_node, switch_ep, light_node, light_ep)
+        : matter_controller_delete_binding(switch_node, switch_ep, light_node, light_ep);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            create ? "Failed to create binding" : "Failed to delete binding");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t bindings_post_handler(httpd_req_t *req)
+{
+    return bindings_request_handler(req, true);
+}
+
+static esp_err_t bindings_delete_handler(httpd_req_t *req)
+{
+    return bindings_request_handler(req, false);
+}
+
+// ---------------------------------------------------------------------------
 // Thread credential sharing
 // ---------------------------------------------------------------------------
 
@@ -648,7 +707,7 @@ esp_err_t web_server_start(void)
     config.lru_purge_enable = true;
     config.uri_match_fn     = httpd_uri_match_wildcard;
     config.stack_size       = 12288;
-    config.max_uri_handlers = 22;
+    config.max_uri_handlers = 24;
     config.max_resp_headers = 20;
 
     httpd_handle_t server = NULL;
@@ -670,6 +729,8 @@ esp_err_t web_server_start(void)
     const httpd_uri_t node_delete        = {.uri = "/api/nodes/*",         .method = HTTP_DELETE, .handler = node_delete_handler};
     const httpd_uri_t edge_post          = {.uri = "/api/edges",           .method = HTTP_POST,   .handler = edge_post_handler};
     const httpd_uri_t edge_delete        = {.uri = "/api/edges/*",         .method = HTTP_DELETE, .handler = edge_delete_handler};
+    const httpd_uri_t bindings_post      = {.uri = "/api/bindings",        .method = HTTP_POST,   .handler = bindings_post_handler};
+    const httpd_uri_t bindings_delete    = {.uri = "/api/bindings",        .method = HTTP_DELETE, .handler = bindings_delete_handler};
     const httpd_uri_t thread_creds_get   = {.uri = "/api/thread/credentials",      .method = HTTP_GET,    .handler = thread_credentials_get_handler};
     const httpd_uri_t thread_creds_del   = {.uri = "/api/thread/credentials",      .method = HTTP_DELETE, .handler = thread_credentials_delete_handler};
     const httpd_uri_t thread_creds_fetch = {.uri = "/api/thread/credentials/fetch",.method = HTTP_POST,   .handler = thread_credentials_fetch_handler};
@@ -690,6 +751,8 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &node_delete);
     httpd_register_uri_handler(server, &edge_post);
     httpd_register_uri_handler(server, &edge_delete);
+    httpd_register_uri_handler(server, &bindings_post);
+    httpd_register_uri_handler(server, &bindings_delete);
     httpd_register_uri_handler(server, &thread_creds_get);
     httpd_register_uri_handler(server, &thread_creds_del);
     httpd_register_uri_handler(server, &thread_creds_fetch);
