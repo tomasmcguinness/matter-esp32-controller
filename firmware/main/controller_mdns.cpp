@@ -41,6 +41,13 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
         publish_address(&addr);
     } else if (id == IP_EVENT_GOT_IP6) {
         auto *event = static_cast<ip_event_got_ip6_t *>(data);
+        esp_ip6_addr_type_t t = esp_netif_ip6_get_addr_type(&event->ip6_info.ip);
+        const char *kind = t == ESP_IP6_ADDR_IS_LINK_LOCAL   ? "link-local"
+                         : t == ESP_IP6_ADDR_IS_GLOBAL        ? "global"
+                         : t == ESP_IP6_ADDR_IS_UNIQUE_LOCAL  ? "unique-local"
+                         : t == ESP_IP6_ADDR_IS_SITE_LOCAL    ? "site-local"
+                         : "other";
+        ESP_LOGI(TAG, "GOT IP6 [%s]: " IPV6STR, kind, IPV62STR(event->ip6_info.ip));
         esp_ip_addr_t addr = {};
         addr.type = ESP_IPADDR_TYPE_V6;
         addr.u_addr.ip6 = event->ip6_info.ip;
