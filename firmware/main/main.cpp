@@ -1,10 +1,13 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_netif.h"
+#include "esp_eth.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_sntp.h"
 
 #include "node_manager.h"
 #include "device_manager.h"
@@ -13,7 +16,70 @@
 #include "controller_mdns.h"
 #include "web_server.h"
 
+#include "ethernet_init.h"
+#include "esp_netif_net_stack.h"
+
 static const char *TAG = "main";
+
+static EventGroupHandle_t s_net_event_group;
+#define IPV6_READY_BIT  BIT0
+#define SNTP_SYNCED_BIT BIT1
+
+static void time_sync_cb(struct timeval *tv)
+{
+    ESP_LOGI(TAG, "SNTP sync complete: %lld", (long long)tv->tv_sec);
+    bool first = !(xEventGroupGetBits(s_net_event_group) & SNTP_SYNCED_BIT);
+    xEventGroupSetBits(s_net_event_group, SNTP_SYNCED_BIT);
+}
+
+static void eth_event_handler(void *arg, esp_event_base_t event_base,
+                              int32_t event_id, void *event_data)
+{
+    esp_netif_t *netif = (esp_netif_t *)arg;
+    struct netif *lwip_netif = (struct netif *)esp_netif_get_netif_impl(netif);
+
+    switch (event_id) {
+    case ETHERNET_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "Ethernet link up");
+        netif_set_flags(lwip_netif, NETIF_FLAG_MLD6);
+        esp_netif_create_ip6_linklocal(netif);
+        break;
+    case ETHERNET_EVENT_DISCONNECTED: ESP_LOGI(TAG, "Ethernet link down"); break;
+    case ETHERNET_EVENT_START:        ESP_LOGI(TAG, "Ethernet started");   break;
+    case ETHERNET_EVENT_STOP:         ESP_LOGI(TAG, "Ethernet stopped");   break;
+    }
+}
+
+static void got_ip6_event_handler(void *arg, esp_event_base_t event_base,
+                                  int32_t event_id, void *event_data)
+{
+    ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)event_data;
+    ESP_LOGI(TAG, "Got IPv6: " IPV6STR, IPV62STR(event->ip6_info.ip));
+
+    // struct netif *lwip_netif = (struct netif *)esp_netif_get_netif_impl(event->esp_netif);
+    // if (lwip_netif != NULL) {
+    //     esp_err_t err = esp_netif_tcpip_exec(join_all_nodes_cb, lwip_netif);
+    //     ESP_LOGW(TAG, "mld6_joingroup ff02::1 -> %s", esp_err_to_name(err));
+    // }
+
+    xEventGroupSetBits(s_net_event_group, IPV6_READY_BIT);
+}
+
+static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
+                                 int32_t event_id, void *event_data)
+{
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+    ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+
+    setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
+    tzset();
+
+    sntp_set_time_sync_notification_cb(time_sync_cb);
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP started");
+}
 
 extern "C" void app_main(void)
 {
@@ -25,7 +91,26 @@ extern "C" void app_main(void)
 
     ESP_ERROR_CHECK(device_manager_init());
 
-    ESP_ERROR_CHECK(thread_credentials_init());
+    //ESP_ERROR_CHECK(thread_credentials_init());
+
+    uint8_t eth_port_cnt = 0;
+    esp_eth_handle_t *eth_handles;
+    ESP_ERROR_CHECK(example_eth_init(&eth_handles, &eth_port_cnt));
+
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_t *eth_netif = esp_netif_new(&cfg);
+    ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handles[0])));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, eth_netif));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_GOT_IP6, &got_ip6_event_handler, NULL));
+
+    s_net_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_eth_start(eth_handles[0]));
+
+    ESP_LOGI(TAG, "Waiting for IPv6 addresses...");
+    xEventGroupWaitBits(s_net_event_group, IPV6_READY_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
 
     ESP_ERROR_CHECK(matter_controller_start());
 

@@ -28,7 +28,7 @@ using namespace chip;
 using namespace chip::Controller;
 using namespace chip::Transport;
 
-namespace home_energy_manager
+namespace matter_controller
 {
     namespace controller
     {
@@ -52,14 +52,12 @@ namespace home_energy_manager
 
         void pairing_command::OnCommissioningSuccess(chip::PeerId peerId)
         {
-            ESP_LOGI(TAG, "Commissioning success with node %" PRIX64 "-%" PRIX64, peerId.GetCompressedFabricId(),
-                     peerId.GetNodeId());
+            ESP_LOGI(TAG, "Commissioning success with node %" PRIX64 "-%" PRIX64, peerId.GetCompressedFabricId(), peerId.GetNodeId());
             auto &controller_instance = esp_matter::controller::matter_controller_client::get_instance();
             controller_instance.get_commissioner()->RegisterPairingDelegate(nullptr);
             if (m_callbacks.commissioning_success_callback)
             {
-                auto fabric = controller_instance.get_commissioner()->GetFabricTable()->FindFabricWithCompressedId(
-                    peerId.GetCompressedFabricId());
+                auto fabric = controller_instance.get_commissioner()->GetFabricTable()->FindFabricWithCompressedId(peerId.GetCompressedFabricId());
                 m_callbacks.commissioning_success_callback(ScopedNodeId(peerId.GetNodeId(), fabric->GetFabricIndex()));
             }
         }
@@ -68,14 +66,12 @@ namespace home_energy_manager
             chip::PeerId peerId, CHIP_ERROR error, chip::Controller::CommissioningStage stageFailed,
             chip::Optional<chip::Credentials::AttestationVerificationResult> additionalErrorInfo)
         {
-            ESP_LOGI(TAG, "Commissioning failure with node %" PRIX64 "-%" PRIX64, peerId.GetCompressedFabricId(),
-                     peerId.GetNodeId());
+            ESP_LOGI(TAG, "Commissioning failure with node %" PRIX64 "-%" PRIX64, peerId.GetCompressedFabricId(), peerId.GetNodeId());
             auto &controller_instance = esp_matter::controller::matter_controller_client::get_instance();
             controller_instance.get_commissioner()->RegisterPairingDelegate(nullptr);
             if (m_callbacks.commissioning_failure_callback)
             {
-                auto fabric = controller_instance.get_commissioner()->GetFabricTable()->FindFabricWithCompressedId(
-                    peerId.GetCompressedFabricId());
+                auto fabric = controller_instance.get_commissioner()->GetFabricTable()->FindFabricWithCompressedId(peerId.GetCompressedFabricId());
                 m_callbacks.commissioning_failure_callback(
                     ScopedNodeId(peerId.GetNodeId(), fabric->GetFabricIndex()), error, stageFailed,
                     additionalErrorInfo.HasValue() ? std::make_optional(additionalErrorInfo.Value()) : std::nullopt);

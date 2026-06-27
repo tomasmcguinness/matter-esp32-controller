@@ -262,6 +262,66 @@ static esp_err_t onoff_get_handler(httpd_req_t *req)
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/acl/:nodeId  -> { "entries": [ { "privilege", "authMode", "subjects" } ] }
+// ---------------------------------------------------------------------------
+
+static esp_err_t acl_get_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    char *json = NULL;
+    esp_err_t err = matter_controller_get_acl(node_id, &json);
+    if (err != ESP_OK || !json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read ACL");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t send_err = httpd_resp_sendstr(req, json);
+    free(json);
+    return send_err;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/bindingtable/:nodeId  -> { "endpoint", "entries": [ { node, endpoint, cluster } ] }
+// ---------------------------------------------------------------------------
+
+static esp_err_t bindingtable_get_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    char *json = NULL;
+    esp_err_t err = matter_controller_get_binding_table(node_id, &json);
+    if (err != ESP_OK || !json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read binding table");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t send_err = httpd_resp_sendstr(req, json);
+    free(json);
+    return send_err;
+}
+
+// ---------------------------------------------------------------------------
 // PUT /api/onoff/:nodeId  body { "on": bool }
 // ---------------------------------------------------------------------------
 
@@ -301,6 +361,33 @@ static esp_err_t onoff_put_handler(httpd_req_t *req)
     esp_err_t err = matter_controller_set_onoff(node_id, on);
     if (err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to set OnOff state");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{}");
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/identify/:nodeId  (no body) - make the device blink for 15s
+// ---------------------------------------------------------------------------
+
+static esp_err_t identify_post_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = matter_controller_identify(node_id);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to identify device");
         return ESP_FAIL;
     }
 
@@ -463,8 +550,10 @@ static esp_err_t edge_delete_handler(httpd_req_t *req)
 
 // ---------------------------------------------------------------------------
 // POST/DELETE /api/bindings
-//   body { "switchNodeId": N, "lightNodeId": N, "switchEndpoint"?: N, "lightEndpoint"?: N }
-// Creates/removes a Matter binding so the switch directly controls the light.
+//   Unicast (switch->light): { "switchNodeId": N, "lightNodeId": N,
+//                              "switchEndpoint"?: N, "lightEndpoint"?: N }
+//   Group   (switch->group): { "switchNodeId": N, "groupId": N, "switchEndpoint"?: N }
+// Creates/removes a Matter binding so the switch directly controls the target.
 // ---------------------------------------------------------------------------
 
 static esp_err_t bindings_request_handler(httpd_req_t *req, bool create)
@@ -481,30 +570,246 @@ static esp_err_t bindings_request_handler(httpd_req_t *req, bool create)
         return ESP_FAIL;
     }
     cJSON *sw_j  = cJSON_GetObjectItemCaseSensitive(root, "switchNodeId");
-    cJSON *lt_j  = cJSON_GetObjectItemCaseSensitive(root, "lightNodeId");
-    if (!cJSON_IsNumber(sw_j) || !cJSON_IsNumber(lt_j)) {
+    if (!cJSON_IsNumber(sw_j)) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing switchNodeId/lightNodeId");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing switchNodeId");
         return ESP_FAIL;
     }
     cJSON *swe_j = cJSON_GetObjectItemCaseSensitive(root, "switchEndpoint");
-    cJSON *lte_j = cJSON_GetObjectItemCaseSensitive(root, "lightEndpoint");
-
     uint64_t switch_node = (uint64_t)sw_j->valuedouble;
-    uint64_t light_node  = (uint64_t)lt_j->valuedouble;
     uint16_t switch_ep   = cJSON_IsNumber(swe_j) ? (uint16_t)swe_j->valuedouble : 0;  // 0 = auto-resolve
-    uint16_t light_ep    = cJSON_IsNumber(lte_j) ? (uint16_t)lte_j->valuedouble : 0;
-    cJSON_Delete(root);
 
-    esp_err_t err = create
-        ? matter_controller_create_binding(switch_node, switch_ep, light_node, light_ep)
-        : matter_controller_delete_binding(switch_node, switch_ep, light_node, light_ep);
+    cJSON *grp_j = cJSON_GetObjectItemCaseSensitive(root, "groupId");
+    esp_err_t err;
+    if (cJSON_IsNumber(grp_j)) {
+        uint16_t group_id = (uint16_t)grp_j->valuedouble;
+        cJSON_Delete(root);
+        err = create
+            ? matter_controller_create_group_binding(switch_node, switch_ep, group_id)
+            : matter_controller_delete_group_binding(switch_node, switch_ep, group_id);
+    } else {
+        cJSON *lt_j  = cJSON_GetObjectItemCaseSensitive(root, "lightNodeId");
+        if (!cJSON_IsNumber(lt_j)) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing lightNodeId/groupId");
+            return ESP_FAIL;
+        }
+        cJSON *lte_j = cJSON_GetObjectItemCaseSensitive(root, "lightEndpoint");
+        uint64_t light_node = (uint64_t)lt_j->valuedouble;
+        uint16_t light_ep   = cJSON_IsNumber(lte_j) ? (uint16_t)lte_j->valuedouble : 0;
+        cJSON_Delete(root);
+        err = create
+            ? matter_controller_create_binding(switch_node, switch_ep, light_node, light_ep)
+            : matter_controller_delete_binding(switch_node, switch_ep, light_node, light_ep);
+    }
+
     if (err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             create ? "Failed to create binding" : "Failed to delete binding");
         return ESP_FAIL;
     }
 
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Matter groups
+//   POST   /api/groups                       -> allocate ids + create group
+//   DELETE /api/groups/:groupId              -> tear down the group locally
+//   POST   /api/groups/:groupId/members      body { nodeId, name? } -> add member
+//   DELETE /api/groups/:groupId/members/:nodeId               -> remove member
+// ---------------------------------------------------------------------------
+
+static esp_err_t groups_create_handler(httpd_req_t *req)
+{
+    // Body is optional; an object { "name": "..." } customises the group name.
+    char body[MAX_POST_BODY + 1];
+    int len = recv_body(req, body, sizeof(body));
+    char name[32] = "";
+    if (len > 0) {
+        cJSON *root = cJSON_Parse(body);
+        if (root) {
+            cJSON *name_j = cJSON_GetObjectItemCaseSensitive(root, "name");
+            if (cJSON_IsString(name_j) && name_j->valuestring)
+                snprintf(name, sizeof(name), "%s", name_j->valuestring);
+            cJSON_Delete(root);
+        }
+    }
+
+    uint16_t group_id = matter_controller_allocate_group_id();
+    esp_err_t err = matter_controller_create_group(group_id, name);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create group");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(resp, "groupId", group_id);
+    return send_json(req, resp, 200);
+}
+
+static esp_err_t group_member_add_handler(httpd_req_t *req)
+{
+    unsigned int group_id = 0;
+    if (sscanf(req->uri, "/api/groups/%u/members", &group_id) != 1 || group_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad group id");
+        return ESP_FAIL;
+    }
+
+    char body[MAX_POST_BODY + 1];
+    if (recv_body(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+        return ESP_FAIL;
+    }
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad JSON");
+        return ESP_FAIL;
+    }
+    cJSON *node_j = cJSON_GetObjectItemCaseSensitive(root, "nodeId");
+    if (!cJSON_IsNumber(node_j)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing nodeId");
+        return ESP_FAIL;
+    }
+    cJSON *name_j = cJSON_GetObjectItemCaseSensitive(root, "name");
+    char name[32] = "";
+    if (cJSON_IsString(name_j) && name_j->valuestring)
+        snprintf(name, sizeof(name), "%s", name_j->valuestring);
+    uint64_t node_id = (uint64_t)node_j->valuedouble;
+    cJSON_Delete(root);
+
+    esp_err_t err = matter_controller_add_group_member(node_id, (uint16_t)group_id, name);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to add member");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// Handles both DELETE /api/groups/:groupId and DELETE /api/groups/:groupId/members/:nodeId.
+static esp_err_t groups_delete_handler(httpd_req_t *req)
+{
+    unsigned int group_id = 0;
+    unsigned long long node_id = 0;
+    esp_err_t err;
+    if (strstr(req->uri, "/members/")) {
+        if (sscanf(req->uri, "/api/groups/%u/members/%llu", &group_id, &node_id) != 2 || group_id == 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad member path");
+            return ESP_FAIL;
+        }
+        err = matter_controller_remove_group_member((uint64_t)node_id, (uint16_t)group_id);
+    } else {
+        if (sscanf(req->uri, "/api/groups/%u", &group_id) != 1 || group_id == 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad group id");
+            return ESP_FAIL;
+        }
+        err = matter_controller_delete_group((uint16_t)group_id);
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Group delete failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// POST /api/resetgroups/:nodeId — clear all group state this controller provisioned
+// on a device (empty GroupKeyMap + KeySetRemove app keysets + RemoveAllGroups).
+static esp_err_t reset_groups_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+    esp_err_t err = matter_controller_reset_node_groups(node_id);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Reset groups failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// POST /api/resetacl/:nodeId — reset a device's ACL to just the controller's
+// Administer entry (drops stale Operate/group/corrupt entries).
+static esp_err_t reset_acl_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+    esp_err_t err = matter_controller_reset_acl(node_id);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Reset ACL failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// POST /api/resetbindings/:nodeId — clear a device's Binding table (the send side).
+static esp_err_t reset_bindings_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+    esp_err_t err = matter_controller_reset_bindings(node_id);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Reset bindings failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// POST /api/grouptoggle/:groupId — controller-originated OnOff Toggle groupcast to a
+// group (diagnostic / manual group control). No body.
+static esp_err_t group_toggle_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    unsigned int group_id = (unsigned int)strtoul(last_slash + 1, NULL, 10);
+    if (group_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid group id");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = matter_controller_groupcast_toggle((uint16_t)group_id);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Groupcast failed");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
@@ -707,7 +1012,7 @@ esp_err_t web_server_start(void)
     config.lru_purge_enable = true;
     config.uri_match_fn     = httpd_uri_match_wildcard;
     config.stack_size       = 12288;
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 32;
     config.max_resp_headers = 20;
 
     httpd_handle_t server = NULL;
@@ -724,6 +1029,9 @@ esp_err_t web_server_start(void)
     const httpd_uri_t reinterview_post   = {.uri = "/api/reinterview/*",   .method = HTTP_POST,   .handler = reinterview_post_handler};
     const httpd_uri_t onoff_get          = {.uri = "/api/onoff/*",         .method = HTTP_GET,    .handler = onoff_get_handler};
     const httpd_uri_t onoff_put          = {.uri = "/api/onoff/*",         .method = HTTP_PUT,    .handler = onoff_put_handler};
+    const httpd_uri_t identify_post      = {.uri = "/api/identify/*",      .method = HTTP_POST,   .handler = identify_post_handler};
+    const httpd_uri_t acl_get            = {.uri = "/api/acl/*",           .method = HTTP_GET,    .handler = acl_get_handler};
+    const httpd_uri_t bindingtable_get   = {.uri = "/api/bindingtable/*",  .method = HTTP_GET,    .handler = bindingtable_get_handler};
     const httpd_uri_t nodes_get          = {.uri = "/api/nodes",           .method = HTTP_GET,    .handler = nodes_get_handler};
     const httpd_uri_t node_put           = {.uri = "/api/nodes/*",         .method = HTTP_PUT,    .handler = node_put_handler};
     const httpd_uri_t node_delete        = {.uri = "/api/nodes/*",         .method = HTTP_DELETE, .handler = node_delete_handler};
@@ -731,6 +1039,13 @@ esp_err_t web_server_start(void)
     const httpd_uri_t edge_delete        = {.uri = "/api/edges/*",         .method = HTTP_DELETE, .handler = edge_delete_handler};
     const httpd_uri_t bindings_post      = {.uri = "/api/bindings",        .method = HTTP_POST,   .handler = bindings_post_handler};
     const httpd_uri_t bindings_delete    = {.uri = "/api/bindings",        .method = HTTP_DELETE, .handler = bindings_delete_handler};
+    const httpd_uri_t groups_post        = {.uri = "/api/groups",          .method = HTTP_POST,   .handler = groups_create_handler};
+    const httpd_uri_t group_member_post  = {.uri = "/api/groups/*",        .method = HTTP_POST,   .handler = group_member_add_handler};
+    const httpd_uri_t groups_delete      = {.uri = "/api/groups/*",        .method = HTTP_DELETE, .handler = groups_delete_handler};
+    const httpd_uri_t reset_groups_post  = {.uri = "/api/resetgroups/*",   .method = HTTP_POST,   .handler = reset_groups_handler};
+    const httpd_uri_t reset_acl_post     = {.uri = "/api/resetacl/*",      .method = HTTP_POST,   .handler = reset_acl_handler};
+    const httpd_uri_t reset_bindings_post = {.uri = "/api/resetbindings/*", .method = HTTP_POST,  .handler = reset_bindings_handler};
+    const httpd_uri_t group_toggle_post  = {.uri = "/api/grouptoggle/*",   .method = HTTP_POST,   .handler = group_toggle_handler};
     const httpd_uri_t thread_creds_get   = {.uri = "/api/thread/credentials",      .method = HTTP_GET,    .handler = thread_credentials_get_handler};
     const httpd_uri_t thread_creds_del   = {.uri = "/api/thread/credentials",      .method = HTTP_DELETE, .handler = thread_credentials_delete_handler};
     const httpd_uri_t thread_creds_fetch = {.uri = "/api/thread/credentials/fetch",.method = HTTP_POST,   .handler = thread_credentials_fetch_handler};
@@ -746,6 +1061,9 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &reinterview_post);
     httpd_register_uri_handler(server, &onoff_get);
     httpd_register_uri_handler(server, &onoff_put);
+    httpd_register_uri_handler(server, &identify_post);
+    httpd_register_uri_handler(server, &acl_get);
+    httpd_register_uri_handler(server, &bindingtable_get);
     httpd_register_uri_handler(server, &nodes_get);
     httpd_register_uri_handler(server, &node_put);
     httpd_register_uri_handler(server, &node_delete);
@@ -753,6 +1071,13 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &edge_delete);
     httpd_register_uri_handler(server, &bindings_post);
     httpd_register_uri_handler(server, &bindings_delete);
+    httpd_register_uri_handler(server, &groups_post);
+    httpd_register_uri_handler(server, &group_member_post);
+    httpd_register_uri_handler(server, &groups_delete);
+    httpd_register_uri_handler(server, &reset_groups_post);
+    httpd_register_uri_handler(server, &reset_acl_post);
+    httpd_register_uri_handler(server, &reset_bindings_post);
+    httpd_register_uri_handler(server, &group_toggle_post);
     httpd_register_uri_handler(server, &thread_creds_get);
     httpd_register_uri_handler(server, &thread_creds_del);
     httpd_register_uri_handler(server, &thread_creds_fetch);

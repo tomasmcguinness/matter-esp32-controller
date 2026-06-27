@@ -4,11 +4,15 @@ import type { ThreadCredentials, BorderAgent } from '../Thread'
 
 type NodeConfig = { id: string; x: number; y: number; settings: Record<string, unknown> }
 type EdgeConfig = { id: string; source: string; target: string; sourceHandle?: string; targetHandle?: string }
-type BindingConfig = { switchNodeId: number; lightNodeId: number }
+type BindingConfig = { switchNodeId: number; lightNodeId?: number; groupId?: number; switchEndpoint?: number; lightEndpoint?: number }
 
 let nodeConfigs: NodeConfig[] = []
 let edgeConfigs: EdgeConfig[] = []
 let bindings: BindingConfig[] = []
+
+// Group membership: groupId -> set of member node ids (mock-only bookkeeping).
+const groupMembers: Record<number, Set<number>> = {}
+let nextGroupId = 1
 
 let devices: CommissionedDevice[] = [
   {
@@ -16,12 +20,21 @@ let devices: CommissionedDevice[] = [
     vendorName: 'Philips',
     productName: 'Hue White',
     deviceType: 0x0100,
+    endpoints: [
+      { endpointId: 0, label: '', included: true, deviceTypes: [0x0016], parts: [1, 2] },
+      { endpointId: 1, label: 'Light', included: true, deviceTypes: [0x0100], parts: [] },
+      { endpointId: 2, label: 'Switch', included: true, deviceTypes: [0x0103], parts: [] },
+    ],
   },
   {
     nodeId: 0x1002,
     vendorName: 'IKEA',
     productName: 'TRADFRI bulb',
     deviceType: 0x0100,
+    endpoints: [
+      { endpointId: 0, label: '', included: true, deviceTypes: [0x0016], parts: [1] },
+      { endpointId: 1, label: 'Bulb', included: true, deviceTypes: [0x0100], parts: [] },
+    ],
   },
   {
     nodeId: 0x2001,
@@ -114,6 +127,41 @@ export const handlers = [
     return HttpResponse.json({})
   }),
 
+  http.get('/api/acl/:nodeId', async ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    if (!devices.some(d => d.nodeId === nodeId)) {
+      return new HttpResponse('Not found', { status: 404 })
+    }
+    // Delay so the modal's loading indicator is visible during dev.
+    await new Promise(resolve => setTimeout(resolve, 400))
+    return HttpResponse.json({
+      entries: [
+        { privilege: 5, authMode: 2, subjects: ['112233'] },
+        { privilege: 3, authMode: 2, subjects: [String(0x1000 + (nodeId % 16))] },
+      ],
+    })
+  }),
+
+  http.get('/api/bindingtable/:nodeId', async ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    if (!devices.some(d => d.nodeId === nodeId)) {
+      return new HttpResponse('Not found', { status: 404 })
+    }
+    // Delay so the modal's loading indicator is visible during dev.
+    await new Promise(resolve => setTimeout(resolve, 400))
+    return HttpResponse.json({
+      endpoint: 1,
+      entries: [
+        { node: String(0x1000 + (nodeId % 16)), endpoint: 1, cluster: 6 },
+      ],
+    })
+  }),
+
+  http.post('/api/identify/:nodeId', ({ params }) => {
+    console.log(`[mock] identify node ${params.nodeId}`)
+    return HttpResponse.json({})
+  }),
+
   http.get('/api/nodes', () => {
     return HttpResponse.json({ nodes: nodeConfigs, edges: edgeConfigs })
   }),
@@ -154,19 +202,96 @@ export const handlers = [
 
   http.post('/api/bindings', async ({ request }) => {
     const body = (await request.json()) as BindingConfig
-    if (typeof body?.switchNodeId !== 'number' || typeof body?.lightNodeId !== 'number') {
-      return new HttpResponse('Missing switchNodeId/lightNodeId', { status: 400 })
+    if (typeof body?.switchNodeId !== 'number') {
+      return new HttpResponse('Missing switchNodeId', { status: 400 })
+    }
+    if (typeof body.groupId === 'number') {
+      const exists = bindings.some(b => b.switchNodeId === body.switchNodeId && b.groupId === body.groupId)
+      if (!exists) bindings.push({ switchNodeId: body.switchNodeId, groupId: body.groupId })
+      console.log('[mock] group-bind switch', body.switchNodeId.toString(16),
+        `(ep ${body.switchEndpoint ?? 'auto'})`, '-> group', body.groupId)
+      return HttpResponse.json({ ok: true })
+    }
+    if (typeof body.lightNodeId !== 'number') {
+      return new HttpResponse('Missing lightNodeId/groupId', { status: 400 })
     }
     const exists = bindings.some(b => b.switchNodeId === body.switchNodeId && b.lightNodeId === body.lightNodeId)
     if (!exists) bindings.push({ switchNodeId: body.switchNodeId, lightNodeId: body.lightNodeId })
-    console.log('[mock] bind switch', body.switchNodeId.toString(16), '-> light', body.lightNodeId.toString(16))
+    console.log('[mock] bind switch', body.switchNodeId.toString(16), `(ep ${body.switchEndpoint ?? 'auto'})`,
+      '-> light', body.lightNodeId.toString(16), `(ep ${body.lightEndpoint ?? 'auto'})`)
     return HttpResponse.json({ ok: true })
   }),
 
   http.delete('/api/bindings', async ({ request }) => {
     const body = (await request.json()) as BindingConfig
-    bindings = bindings.filter(b => !(b.switchNodeId === body.switchNodeId && b.lightNodeId === body.lightNodeId))
-    console.log('[mock] unbind switch', body.switchNodeId?.toString(16), '-> light', body.lightNodeId?.toString(16))
+    if (typeof body.groupId === 'number') {
+      bindings = bindings.filter(b => !(b.switchNodeId === body.switchNodeId && b.groupId === body.groupId))
+      console.log('[mock] group-unbind switch', body.switchNodeId?.toString(16), '-> group', body.groupId)
+    } else {
+      bindings = bindings.filter(b => !(b.switchNodeId === body.switchNodeId && b.lightNodeId === body.lightNodeId))
+      console.log('[mock] unbind switch', body.switchNodeId?.toString(16), `(ep ${body.switchEndpoint ?? 'auto'})`,
+        '-> light', body.lightNodeId?.toString(16), `(ep ${body.lightEndpoint ?? 'auto'})`)
+    }
+    return HttpResponse.json({ ok: true })
+  }),
+
+  // ---- Matter groups -------------------------------------------------------
+  http.post('/api/groups', async () => {
+    const groupId = nextGroupId++
+    groupMembers[groupId] = new Set()
+    console.log('[mock] create group', groupId)
+    return HttpResponse.json({ groupId, keysetId: groupId })
+  }),
+
+  http.post('/api/groups/:groupId/members', async ({ params, request }) => {
+    const groupId = Number(params.groupId)
+    const body = (await request.json()) as { nodeId: number; name?: string }
+    if (typeof body?.nodeId !== 'number') {
+      return new HttpResponse('Missing nodeId', { status: 400 })
+    }
+    ;(groupMembers[groupId] ??= new Set()).add(body.nodeId)
+    console.log('[mock] add node', body.nodeId.toString(16), 'to group', groupId)
+    return HttpResponse.json({ ok: true })
+  }),
+
+  http.delete('/api/groups/:groupId/members/:nodeId', ({ params }) => {
+    const groupId = Number(params.groupId)
+    const nodeId = Number(params.nodeId)
+    groupMembers[groupId]?.delete(nodeId)
+    console.log('[mock] remove node', nodeId.toString(16), 'from group', groupId)
+    return HttpResponse.json({ ok: true })
+  }),
+
+  http.post('/api/resetgroups/:nodeId', ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    for (const gid of Object.keys(groupMembers)) groupMembers[Number(gid)]?.delete(nodeId)
+    console.log('[mock] reset groups on node', nodeId.toString(16))
+    return HttpResponse.json({ ok: true })
+  }),
+
+  http.post('/api/resetacl/:nodeId', ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    console.log('[mock] reset ACL on node', nodeId.toString(16))
+    return HttpResponse.json({ ok: true })
+  }),
+
+  http.post('/api/resetbindings/:nodeId', ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    console.log('[mock] reset bindings on node', nodeId.toString(16))
+    return HttpResponse.json({ ok: true })
+  }),
+
+  http.post('/api/grouptoggle/:groupId', ({ params }) => {
+    const groupId = Number(params.groupId)
+    console.log('[mock] groupcast Toggle to group', groupId)
+    return HttpResponse.json({ ok: true })
+  }),
+
+  http.delete('/api/groups/:groupId', ({ params }) => {
+    const groupId = Number(params.groupId)
+    delete groupMembers[groupId]
+    bindings = bindings.filter(b => b.groupId !== groupId)
+    console.log('[mock] delete group', groupId)
     return HttpResponse.json({ ok: true })
   }),
 

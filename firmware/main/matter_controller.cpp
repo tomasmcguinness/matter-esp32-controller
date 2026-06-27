@@ -12,6 +12,10 @@
 #include <esp_matter_controller_pairing_command.h>
 #include <esp_matter_controller_read_command.h>
 #include <esp_matter_controller_write_command.h>
+#include <esp_matter_controller_group_settings.h>
+
+#include <esp_random.h>
+#include <mbedtls/base64.h>
 
 #include "ws_server.h"
 #include "cJSON.h"
@@ -37,6 +41,7 @@
 #include <setup_payload/SetupPayload.h>
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -47,6 +52,7 @@ using namespace chip::app::Clusters;
 static const char *TAG = "matter_controller";
 
 static constexpr char kNodeIdCounterKey[] = "MC_NodeIdCnt";
+static constexpr char kGroupIdCounterKey[] = "MC_GrpIdCnt";
 static constexpr char kNodeListKey[]      = "MC_NodeList";
 static constexpr size_t kMaxNodes         = 32;
 static constexpr uint64_t kFirstDeviceNodeId = 1;
@@ -64,6 +70,10 @@ static constexpr uint32_t kOnOffCluster          = 0x0006;
 static constexpr uint32_t kOnOffAttribute        = 0x0000;
 static constexpr uint32_t kOnOffCmdOff           = 0x00;
 static constexpr uint32_t kOnOffCmdOn            = 0x01;
+static constexpr uint32_t kOnOffCmdToggle        = 0x02;
+static constexpr uint32_t kIdentifyCluster       = 0x0003;
+static constexpr uint32_t kIdentifyCmdIdentify   = 0x00;
+static constexpr uint16_t kIdentifyTimeSeconds   = 15;
 
 // Binding / Access Control clusters used for switch->light bindings.
 static constexpr uint32_t kBindingCluster        = 0x001E;
@@ -77,6 +87,30 @@ static constexpr uint64_t kControllerNodeId      = 112233ULL;
 static constexpr uint8_t  kAclPrivilegeOperate   = 3;
 static constexpr uint8_t  kAclPrivilegeAdminister = 5;
 static constexpr uint8_t  kAclAuthModeCase       = 2;
+static constexpr uint8_t  kAclAuthModeGroup      = 3;
+
+// Group Key Management (0x003F) + Groups (0x0004) clusters for Matter groups.
+static constexpr uint32_t kGroupKeyMgmtCluster   = 0x003F;
+static constexpr uint32_t kGroupKeyMapAttribute  = 0x0000;  // GroupKeyMap (list)
+static constexpr uint32_t kKeySetWriteCommand    = 0x0000;
+static constexpr uint32_t kKeySetRemoveCommand   = 0x0003;
+static constexpr uint32_t kGroupsCluster         = 0x0004;
+static constexpr uint32_t kAddGroupCommand       = 0x0000;
+static constexpr uint32_t kRemoveGroupCommand    = 0x0003;
+static constexpr uint32_t kRemoveAllGroupsCommand = 0x0004;
+// Upper bound for KeySetRemove sweep when resetting a device's groups. Removing a
+// non-existent keyset just returns NOT_FOUND (harmless); covers all app keysets ever
+// allocated by the old keyset-per-group scheme.
+static constexpr uint16_t kMaxGroupKeysetScan    = 32;
+// TrustFirst group key security policy; single 16-byte epoch key per keyset.
+static constexpr uint8_t  kGroupKeyPolicyTrustFirst = 0;
+static constexpr size_t   kEpochKeyLen           = 16;
+// Every group shares this single application keyset (keyset 0 is the IPK). Devices
+// have a tiny per-fabric group-key table, so a keyset-per-group exhausts it fast.
+static constexpr uint16_t kAppKeysetId           = 1;
+// NVS key prefix for persisting each keyset's epoch key (so members added later
+// can be issued the same key). Kept out of the web/node layer on purpose.
+static constexpr char     kKeysetKeyPrefix[]     = "MC_GK";
 
 // ---------------------------------------------------------------------------
 // Node ID counter (NVS)
@@ -90,6 +124,17 @@ uint64_t matter_controller_allocate_node_id(void)
     uint64_t next = node_id + 1;
     chip::DeviceLayer::PersistedStorage::KeyValueStoreMgr().Put(kNodeIdCounterKey, &next, sizeof(next));
     return node_id;
+}
+
+uint16_t matter_controller_allocate_group_id(void)
+{
+    // Group ids start at 1 (0 is the reserved "undefined" group id in Matter).
+    uint16_t group_id = 1;
+    size_t read_size = sizeof(group_id);
+    chip::DeviceLayer::PersistedStorage::KeyValueStoreMgr().Get(kGroupIdCounterKey, &group_id, sizeof(group_id), &read_size);
+    uint16_t next = group_id + 1;
+    chip::DeviceLayer::PersistedStorage::KeyValueStoreMgr().Put(kGroupIdCounterKey, &next, sizeof(next));
+    return group_id;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +214,22 @@ static uint32_t select_primary_device_type(const std::map<uint16_t, std::vector<
 // devices.json and the canvas node have been written.
 static SemaphoreHandle_t s_interrogation_done = nullptr;
 
-// Add the freshly-interrogated device to the ReactFlow canvas (nodes.json).
+// Builds the canvas node settings (label / nodeId / deviceType). Caller frees.
+static char *build_node_settings_json(uint64_t node_id, uint32_t primary_type)
+{
+    cJSON *settings = cJSON_CreateObject();
+    char label[40];
+    snprintf(label, sizeof(label), "Node 0x%llX", (unsigned long long)node_id);
+    cJSON_AddStringToObject(settings, "label", label);
+    cJSON_AddNumberToObject(settings, "nodeId", (double)node_id);
+    cJSON_AddNumberToObject(settings, "deviceType", (double)primary_type);
+    char *json = cJSON_PrintUnformatted(settings);
+    cJSON_Delete(settings);
+    return json;
+}
+
+// Create the device's ReactFlow canvas node (nodes.json) at a grid position. Called as soon as
+// the device is commissioned, with primary_type 0 (unknown) until interrogation enriches it.
 static void add_canvas_node(uint64_t node_id, uint32_t primary_type)
 {
     char id[32];
@@ -180,22 +240,25 @@ static void add_canvas_node(uint64_t node_id, uint32_t primary_type)
     float x = 80.0f + 200.0f * (float)(idx % 4);
     float y = 80.0f + 160.0f * (float)(idx / 4);
 
-    cJSON *settings = cJSON_CreateObject();
-    char label[40];
-    snprintf(label, sizeof(label), "Node 0x%llX", (unsigned long long)node_id);
-    cJSON_AddStringToObject(settings, "label", label);
-    cJSON_AddNumberToObject(settings, "nodeId", (double)node_id);
-    cJSON_AddNumberToObject(settings, "deviceType", (double)primary_type);
-    char *settings_json = cJSON_PrintUnformatted(settings);
-    cJSON_Delete(settings);
-
+    char *settings_json = build_node_settings_json(node_id, primary_type);
     node_manager_upsert(id, x, y, settings_json);
+    free(settings_json);
+}
+
+// Enrich an already-created canvas node with the discovered device type, preserving its position.
+static void update_canvas_node_type(uint64_t node_id, uint32_t primary_type)
+{
+    char id[32];
+    snprintf(id, sizeof(id), "%llu", (unsigned long long)node_id);
+    char *settings_json = build_node_settings_json(node_id, primary_type);
+    node_manager_update_settings(id, settings_json);
     free(settings_json);
 }
 
 static void on_interrogation_attr(uint64_t node_id,
                                   const chip::app::ConcreteDataAttributePath &path,
-                                  chip::TLV::TLVReader *data)
+                                  chip::TLV::TLVReader *data,
+                                  const chip::app::StatusIB &status)
 {
     if (!data)
         return;
@@ -284,8 +347,9 @@ static void on_interrogation_done(uint64_t node_id,
     device_manager_resolve_parents(node_id);
     device_manager_persist();
 
-    // Mirror the device onto the ReactFlow canvas.
-    add_canvas_node(node_id, primary_type);
+    // The canvas node was already created at commission time; enrich it with the discovered
+    // device type (keeping the position the user may have set).
+    update_canvas_node_type(node_id, primary_type);
 
     if (s_interrogation_done)
         xSemaphoreGive(s_interrogation_done);
@@ -293,8 +357,6 @@ static void on_interrogation_done(uint64_t node_id,
 
 static void interrogate_node(uint64_t node_id)
 {
-    device_manager_add_device(node_id);
-
     chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> attr_paths;
     chip::Platform::ScopedMemoryBufferWithSize<chip::app::EventPathParams> event_paths;
     attr_paths.Alloc(4);
@@ -334,7 +396,8 @@ static bool s_onoff_read_ok = false;
 
 static void on_onoff_read_attr(uint64_t node_id,
                                const chip::app::ConcreteDataAttributePath &path,
-                               chip::TLV::TLVReader *data)
+                               chip::TLV::TLVReader *data,
+                               const chip::app::StatusIB &status)
 {
     if (!data)
         return;
@@ -428,6 +491,29 @@ esp_err_t matter_controller_set_onoff(uint64_t node_id, bool on)
     return err;
 }
 
+esp_err_t matter_controller_identify(uint64_t node_id)
+{
+    // Identify is mandatory on application device-type endpoints. Prefer the
+    // device's On/Off endpoint when known; otherwise fall back to endpoint 1,
+    // the standard Matter primary application endpoint.
+    uint16_t endpoint_id = 1;
+    device_manager_get_onoff_endpoint(node_id, &endpoint_id);
+
+    // IdentifyTime (field 0, U16) in seconds; esp-matter parses the data field
+    // as {"<tag>:<type>": value}.
+    char command_data[32];
+    snprintf(command_data, sizeof(command_data), "{\"0:U16\": %u}", (unsigned)kIdentifyTimeSeconds);
+
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    esp_err_t err = esp_matter::controller::send_invoke_cluster_command(
+        node_id, endpoint_id, kIdentifyCluster, kIdentifyCmdIdentify, command_data);
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "Identify command failed for node 0x%llx: 0x%x", (unsigned long long)node_id, err);
+    return err;
+}
+
 // ---------------------------------------------------------------------------
 // Binding (switch -> light) via Binding + Access Control clusters
 // ---------------------------------------------------------------------------
@@ -436,12 +522,30 @@ struct binding_target_t {
     uint64_t node;
     uint16_t endpoint;
     uint32_t cluster;
+    uint16_t group;     // valid when is_group
+    bool     is_group;
 };
 
 static SemaphoreHandle_t s_rmw_read_done = nullptr;
 static bool s_rmw_read_ok = false;
 static std::vector<binding_target_t> s_binding_entries;
 static std::vector<uint64_t> s_acl_operate_subjects;
+
+// Full ACL snapshot captured by on_acl_read_full for matter_controller_get_acl
+// and for the group-membership ACL read-modify-write.
+struct acl_entry_t {
+    uint8_t privilege;
+    uint8_t auth_mode;
+    std::vector<uint64_t> subjects;
+};
+static std::vector<acl_entry_t> s_acl_entries;
+
+// GroupKeyMap (Group Key Management 0x003F attr 0x0000) entries captured for RMW.
+struct group_key_map_t {
+    uint16_t group_id;
+    uint16_t keyset_id;
+};
+static std::vector<group_key_map_t> s_group_key_map;
 
 static void on_rmw_read_done(uint64_t,
                              const chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> &,
@@ -454,7 +558,8 @@ static void on_rmw_read_done(uint64_t,
 // Captures the existing unicast Binding targets on the switch endpoint.
 static void on_binding_read_attr(uint64_t,
                                  const chip::app::ConcreteDataAttributePath &path,
-                                 chip::TLV::TLVReader *data)
+                                 chip::TLV::TLVReader *data,
+                                 const chip::app::StatusIB& status)
 {
     if (!data || path.mClusterId != kBindingCluster || path.mAttributeId != kBindingAttribute)
         return;
@@ -466,17 +571,24 @@ static void on_binding_read_attr(uint64_t,
         chip::TLV::TLVType struct_type;
         if (data->EnterContainer(struct_type) != CHIP_NO_ERROR)
             continue;
-        binding_target_t t = {0, 0, 0};
-        bool has_ep = false, has_cluster = false;
+        binding_target_t t = {0, 0, 0, 0, false};
+        bool has_ep = false, has_cluster = false, has_group = false;
         while (data->Next() == CHIP_NO_ERROR) {
             uint32_t tag = chip::TLV::TagNumFromTag(data->GetTag());
             if (tag == 1) data->Get(t.node);                                  // Node
+            else if (tag == 2) has_group = (data->Get(t.group) == CHIP_NO_ERROR);   // Group
             else if (tag == 3) has_ep = (data->Get(t.endpoint) == CHIP_NO_ERROR);   // Endpoint
             else if (tag == 4) has_cluster = (data->Get(t.cluster) == CHIP_NO_ERROR); // Cluster
         }
         data->ExitContainer(struct_type);
-        if (has_ep && has_cluster)  // unicast binding only (skip group bindings)
+        // Preserve both flavours so a read-modify-write never drops the other:
+        // group targets carry a Group id, unicast targets carry Endpoint+Cluster.
+        if (has_group) {
+            t.is_group = true;
             s_binding_entries.push_back(t);
+        } else if (has_ep && has_cluster) {
+            s_binding_entries.push_back(t);
+        }
     }
     data->ExitContainer(list_type);
     s_rmw_read_ok = true;
@@ -485,7 +597,8 @@ static void on_binding_read_attr(uint64_t,
 // Captures the subjects of existing Operate/CASE ACL entries on the light.
 static void on_acl_read_attr(uint64_t,
                              const chip::app::ConcreteDataAttributePath &path,
-                             chip::TLV::TLVReader *data)
+                             chip::TLV::TLVReader *data,
+                             const chip::app::StatusIB& status)
 {
     if (!data || path.mClusterId != kAclCluster || path.mAttributeId != kAclAttribute)
         return;
@@ -527,6 +640,78 @@ static void on_acl_read_attr(uint64_t,
     s_rmw_read_ok = true;
 }
 
+// Captures every ACL entry (privilege, auth mode, subjects) into s_acl_entries
+// for read-only display via matter_controller_get_acl.
+static void on_acl_read_full(uint64_t,
+                             const chip::app::ConcreteDataAttributePath &path,
+                             chip::TLV::TLVReader *data,
+                             const chip::app::StatusIB& status)
+{
+    if (!data || path.mClusterId != kAclCluster || path.mAttributeId != kAclAttribute)
+        return;
+    s_acl_entries.clear();
+    chip::TLV::TLVType list_type;
+    if (data->EnterContainer(list_type) != CHIP_NO_ERROR)
+        return;
+    while (data->Next() == CHIP_NO_ERROR) {
+        chip::TLV::TLVType struct_type;
+        if (data->EnterContainer(struct_type) != CHIP_NO_ERROR)
+            continue;
+        acl_entry_t entry = {0, 0, {}};
+        while (data->Next() == CHIP_NO_ERROR) {
+            uint32_t tag = chip::TLV::TagNumFromTag(data->GetTag());
+            if (tag == 1) data->Get(entry.privilege);        // Privilege
+            else if (tag == 2) data->Get(entry.auth_mode);   // AuthMode
+            else if (tag == 3 && data->GetType() == chip::TLV::kTLVType_Array) { // Subjects
+                chip::TLV::TLVType subj_type;
+                if (data->EnterContainer(subj_type) == CHIP_NO_ERROR) {
+                    while (data->Next() == CHIP_NO_ERROR) {
+                        uint64_t subj = 0;
+                        if (data->Get(subj) == CHIP_NO_ERROR)
+                            entry.subjects.push_back(subj);
+                    }
+                    data->ExitContainer(subj_type);
+                }
+            }
+        }
+        data->ExitContainer(struct_type);
+        s_acl_entries.push_back(std::move(entry));
+    }
+    data->ExitContainer(list_type);
+    s_rmw_read_ok = true;
+}
+
+// Captures the existing GroupKeyMap entries on a device (EP0) for read-modify-write.
+static void on_groupkeymap_read_attr(uint64_t,
+                                     const chip::app::ConcreteDataAttributePath &path,
+                                     chip::TLV::TLVReader *data,
+                                     const chip::app::StatusIB& status)
+{
+    if (!data || path.mClusterId != kGroupKeyMgmtCluster || path.mAttributeId != kGroupKeyMapAttribute)
+        return;
+    s_group_key_map.clear();
+    chip::TLV::TLVType list_type;
+    if (data->EnterContainer(list_type) != CHIP_NO_ERROR)
+        return;
+    while (data->Next() == CHIP_NO_ERROR) {
+        chip::TLV::TLVType struct_type;
+        if (data->EnterContainer(struct_type) != CHIP_NO_ERROR)
+            continue;
+        group_key_map_t e = {0, 0};
+        bool has_group = false, has_keyset = false;
+        while (data->Next() == CHIP_NO_ERROR) {
+            uint32_t tag = chip::TLV::TagNumFromTag(data->GetTag());
+            if (tag == 1) has_group = (data->Get(e.group_id) == CHIP_NO_ERROR);    // GroupId
+            else if (tag == 2) has_keyset = (data->Get(e.keyset_id) == CHIP_NO_ERROR); // GroupKeySetID
+        }
+        data->ExitContainer(struct_type);
+        if (has_group && has_keyset)
+            s_group_key_map.push_back(e);
+    }
+    data->ExitContainer(list_type);
+    s_rmw_read_ok = true;
+}
+
 static esp_err_t blocking_read_attr(uint64_t node_id, uint16_t endpoint_id, uint32_t cluster_id,
                                     uint32_t attribute_id,
                                     esp_matter::controller::attribute_report_cb_t attr_cb)
@@ -537,6 +722,10 @@ static esp_err_t blocking_read_attr(uint64_t node_id, uint16_t endpoint_id, uint
             return ESP_ERR_NO_MEM;
     }
     s_rmw_read_ok = false;
+    // Drain any stale signal left by a previous read that timed out (returned
+    // ESP_ERR_TIMEOUT) but completed afterwards, so we block on THIS read's
+    // completion instead of returning immediately on the leftover signal.
+    xSemaphoreTake(s_rmw_read_done, 0);
 
     chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> attr_paths;
     chip::Platform::ScopedMemoryBufferWithSize<chip::app::EventPathParams> event_paths;
@@ -547,8 +736,15 @@ static esp_err_t blocking_read_attr(uint64_t node_id, uint16_t endpoint_id, uint
 
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     auto *cmd = new esp_matter::controller::read_command(
-        node_id, std::move(attr_paths), std::move(event_paths),
-        attr_cb, on_rmw_read_done, nullptr);
+        node_id, 
+        std::move(attr_paths), 
+        std::move(event_paths),
+        attr_cb, 
+        on_rmw_read_done, 
+        nullptr,
+        nullptr,
+        nullptr,
+        true);
     if (cmd)
         cmd->send_command();
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
@@ -610,19 +806,114 @@ static std::string build_binding_json(const std::vector<binding_target_t> &targe
     char buf[128];
     std::string json = "{\"0:ARR-OBJ\":[";
     for (size_t i = 0; i < targets.size(); ++i) {
-        snprintf(buf, sizeof(buf),
-                 "%s{\"1:U64\":\"%llu\",\"3:U16\":%u,\"4:U32\":%lu}",
-                 i ? "," : "", (unsigned long long)targets[i].node,
-                 (unsigned)targets[i].endpoint, (unsigned long)targets[i].cluster);
+        const binding_target_t &t = targets[i];
+        if (t.is_group)
+            // Group target: Group (tag 2) + Cluster (tag 4), no Node/Endpoint.
+            snprintf(buf, sizeof(buf), "%s{\"2:U16\":%u,\"4:U32\":%lu}",
+                     i ? "," : "", (unsigned)t.group, (unsigned long)t.cluster);
+        else
+            snprintf(buf, sizeof(buf), "%s{\"1:U64\":\"%llu\",\"3:U16\":%u,\"4:U32\":%lu}",
+                     i ? "," : "", (unsigned long long)t.node,
+                     (unsigned)t.endpoint, (unsigned long)t.cluster);
         json += buf;
     }
     json += "]}";
     return json;
 }
 
+esp_err_t matter_controller_get_acl(uint64_t node_id, char **json_out)
+{
+    if (!json_out)
+        return ESP_ERR_INVALID_ARG;
+    *json_out = nullptr;
+
+    s_acl_entries.clear();
+    esp_err_t err = blocking_read_attr(node_id, 0, kAclCluster, kAclAttribute, on_acl_read_full);
+    if (err != ESP_OK)
+        return err;
+
+    // Subjects are emitted as JSON strings to avoid 64-bit precision loss in JS.
+    std::string json = "{\"entries\":[";
+    for (size_t i = 0; i < s_acl_entries.size(); ++i) {
+        const acl_entry_t &e = s_acl_entries[i];
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s{\"privilege\":%u,\"authMode\":%u,\"subjects\":[",
+                 i ? "," : "", (unsigned)e.privilege, (unsigned)e.auth_mode);
+        json += buf;
+        for (size_t j = 0; j < e.subjects.size(); ++j) {
+            snprintf(buf, sizeof(buf), "%s\"%llu\"", j ? "," : "",
+                     (unsigned long long)e.subjects[j]);
+            json += buf;
+        }
+        json += "]}";
+    }
+    json += "]}";
+
+    char *out = (char *)malloc(json.size() + 1);
+    if (!out)
+        return ESP_ERR_NO_MEM;
+    memcpy(out, json.c_str(), json.size() + 1);
+    *json_out = out;
+    return ESP_OK;
+}
+
+esp_err_t matter_controller_get_binding_table(uint64_t node_id, char **json_out)
+{
+    if (!json_out)
+        return ESP_ERR_INVALID_ARG;
+    *json_out = nullptr;
+
+    s_binding_entries.clear();
+
+    // The Binding cluster lives on the device's switch endpoint. If the device has
+    // no switch endpoint it cannot hold bindings; report an empty table rather than
+    // an error so the UI shows a clean "no bindings" state.
+    uint16_t endpoint = 0;
+    esp_err_t err = device_manager_get_switch_endpoint(node_id, &endpoint);
+    if (err == ESP_OK) {
+        err = blocking_read_attr(node_id, endpoint, kBindingCluster, kBindingAttribute,
+                                 on_binding_read_attr);
+        if (err != ESP_OK)
+            return err;
+    }
+
+    std::string json = "{\"endpoint\":";
+    if (err == ESP_OK)
+        json += std::to_string((unsigned)endpoint);
+    else
+        json += "null";
+    json += ",\"entries\":[";
+    // node is a JSON string to avoid 64-bit precision loss in JS. Group bindings
+    // carry a group id (no node/endpoint) and are emitted with a "group" field.
+    for (size_t i = 0; i < s_binding_entries.size(); ++i) {
+        const binding_target_t &t = s_binding_entries[i];
+        char buf[96];
+        if (t.is_group)
+            snprintf(buf, sizeof(buf), "%s{\"group\":%u,\"cluster\":%lu}",
+                     i ? "," : "", (unsigned)t.group, (unsigned long)t.cluster);
+        else
+            snprintf(buf, sizeof(buf), "%s{\"node\":\"%llu\",\"endpoint\":%u,\"cluster\":%lu}",
+                     i ? "," : "", (unsigned long long)t.node,
+                     (unsigned)t.endpoint, (unsigned long)t.cluster);
+        json += buf;
+    }
+    json += "]}";
+
+    char *out = (char *)malloc(json.size() + 1);
+    if (!out)
+        return ESP_ERR_NO_MEM;
+    memcpy(out, json.c_str(), json.size() + 1);
+    *json_out = out;
+    return ESP_OK;
+}
+
 esp_err_t matter_controller_create_binding(uint64_t switch_node_id, uint16_t switch_endpoint,
                                            uint64_t light_node_id, uint16_t light_endpoint)
 {
+    ESP_LOGI(TAG, "create_binding: requested switch 0x%llx ep%u -> light 0x%llx ep%u (ep 0 = auto-resolve)",
+             (unsigned long long)switch_node_id, switch_endpoint,
+             (unsigned long long)light_node_id, light_endpoint);
+
     esp_err_t err;
     if (switch_endpoint == 0) {
         err = device_manager_get_switch_endpoint(switch_node_id, &switch_endpoint);
@@ -630,6 +921,8 @@ esp_err_t matter_controller_create_binding(uint64_t switch_node_id, uint16_t swi
             ESP_LOGW(TAG, "No switch endpoint for node 0x%llx", (unsigned long long)switch_node_id);
             return err;
         }
+        ESP_LOGI(TAG, "create_binding: resolved switch endpoint to ep%u for node 0x%llx",
+                 switch_endpoint, (unsigned long long)switch_node_id);
     }
     if (light_endpoint == 0) {
         err = device_manager_get_onoff_endpoint(light_node_id, &light_endpoint);
@@ -637,40 +930,77 @@ esp_err_t matter_controller_create_binding(uint64_t switch_node_id, uint16_t swi
             ESP_LOGW(TAG, "No OnOff endpoint for node 0x%llx", (unsigned long long)light_node_id);
             return err;
         }
+        ESP_LOGI(TAG, "create_binding: resolved light endpoint to ep%u for node 0x%llx",
+                 light_endpoint, (unsigned long long)light_node_id);
     }
 
     // 1. Grant the switch Operate access on the light's ACL (read-modify-write, preserving the
     //    controller's Administer entry). Done before the binding so the switch's first command
     //    is already authorized.
+    ESP_LOGI(TAG, "create_binding: reading ACL on light 0x%llx ep0", (unsigned long long)light_node_id);
     err = blocking_read_attr(light_node_id, 0, kAclCluster, kAclAttribute, on_acl_read_attr);
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "create_binding: ACL read on light 0x%llx failed: 0x%x",
+                 (unsigned long long)light_node_id, err);
         return err;
+    }
     std::vector<uint64_t> subjects = s_acl_operate_subjects;
-    if (std::find(subjects.begin(), subjects.end(), switch_node_id) == subjects.end())
+    ESP_LOGI(TAG, "create_binding: light 0x%llx has %u existing Operate subject(s)",
+             (unsigned long long)light_node_id, (unsigned)subjects.size());
+    if (std::find(subjects.begin(), subjects.end(), switch_node_id) == subjects.end()) {
         subjects.push_back(switch_node_id);
+        ESP_LOGI(TAG, "create_binding: adding switch 0x%llx as Operate subject (now %u subject(s))",
+                 (unsigned long long)switch_node_id, (unsigned)subjects.size());
+    } else {
+        ESP_LOGI(TAG, "create_binding: switch 0x%llx already an Operate subject, ACL unchanged",
+                 (unsigned long long)switch_node_id);
+    }
     std::string acl_json = build_acl_json(kControllerNodeId, subjects);
+    ESP_LOGI(TAG, "create_binding: writing ACL to light 0x%llx: %s",
+             (unsigned long long)light_node_id, acl_json.c_str());
     err = blocking_write_attr(light_node_id, 0, kAclCluster, kAclAttribute, acl_json.c_str());
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "create_binding: ACL write to light 0x%llx failed: 0x%x",
+                 (unsigned long long)light_node_id, err);
         return err;
+    }
 
     // 2. Add the light as a binding target on the switch (read-modify-write so existing bindings
     //    on the switch endpoint are preserved).
+    ESP_LOGI(TAG, "create_binding: reading Binding list on switch 0x%llx ep%u",
+             (unsigned long long)switch_node_id, switch_endpoint);
     err = blocking_read_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
                              on_binding_read_attr);
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "create_binding: Binding read on switch 0x%llx ep%u failed: 0x%x",
+                 (unsigned long long)switch_node_id, switch_endpoint, err);
         return err;
+    }
     std::vector<binding_target_t> targets = s_binding_entries;
+    ESP_LOGI(TAG, "create_binding: switch 0x%llx ep%u has %u existing binding target(s)",
+             (unsigned long long)switch_node_id, switch_endpoint, (unsigned)targets.size());
     bool exists = false;
     for (const auto &t : targets)
         if (t.node == light_node_id && t.endpoint == light_endpoint && t.cluster == kOnOffCluster)
             { exists = true; break; }
-    if (!exists)
+    if (!exists) {
         targets.push_back({light_node_id, light_endpoint, kOnOffCluster});
+        ESP_LOGI(TAG, "create_binding: adding light 0x%llx ep%u (OnOff) target (now %u target(s))",
+                 (unsigned long long)light_node_id, light_endpoint, (unsigned)targets.size());
+    } else {
+        ESP_LOGI(TAG, "create_binding: light 0x%llx ep%u already a binding target, list unchanged",
+                 (unsigned long long)light_node_id, light_endpoint);
+    }
     std::string binding_json = build_binding_json(targets);
+    ESP_LOGI(TAG, "create_binding: writing Binding list to switch 0x%llx ep%u: %s",
+             (unsigned long long)switch_node_id, switch_endpoint, binding_json.c_str());
     err = blocking_write_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
                               binding_json.c_str());
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "create_binding: Binding write to switch 0x%llx ep%u failed: 0x%x",
+                 (unsigned long long)switch_node_id, switch_endpoint, err);
         return err;
+    }
 
     ESP_LOGI(TAG, "Created binding switch 0x%llx ep%u -> light 0x%llx ep%u",
              (unsigned long long)switch_node_id, switch_endpoint,
@@ -716,6 +1046,421 @@ esp_err_t matter_controller_delete_binding(uint64_t switch_node_id, uint16_t swi
     ESP_LOGI(TAG, "Deleted binding switch 0x%llx -> light 0x%llx",
              (unsigned long long)switch_node_id, (unsigned long long)light_node_id);
     return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Matter groups (Group Key Management 0x003F + Groups 0x0004)
+// ---------------------------------------------------------------------------
+
+static void bytes_to_hex(const uint8_t *bytes, size_t len, char *out /*>= 2*len+1*/)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; ++i) {
+        out[2 * i]     = hex[bytes[i] >> 4];
+        out[2 * i + 1] = hex[bytes[i] & 0x0F];
+    }
+    out[2 * len] = '\0';
+}
+
+// Persist/look up a keyset's 16-byte epoch key in NVS so members added after the
+// group is created can be issued the identical key (KeySetWrite).
+static esp_err_t keyset_key_store(uint16_t keyset_id, const uint8_t key[kEpochKeyLen])
+{
+    char k[16];
+    snprintf(k, sizeof(k), "%s%u", kKeysetKeyPrefix, (unsigned)keyset_id);
+    return chip::DeviceLayer::PersistedStorage::KeyValueStoreMgr().Put(k, key, kEpochKeyLen) == CHIP_NO_ERROR
+               ? ESP_OK : ESP_FAIL;
+}
+
+static bool keyset_key_load(uint16_t keyset_id, uint8_t key[kEpochKeyLen])
+{
+    char k[16];
+    snprintf(k, sizeof(k), "%s%u", kKeysetKeyPrefix, (unsigned)keyset_id);
+    size_t read_size = kEpochKeyLen;
+    return chip::DeviceLayer::PersistedStorage::KeyValueStoreMgr().Get(k, key, kEpochKeyLen, &read_size) ==
+               CHIP_NO_ERROR && read_size == kEpochKeyLen;
+}
+
+static esp_err_t blocking_invoke_cmd(uint64_t node_id, uint16_t endpoint_id, uint32_t cluster_id,
+                                     uint32_t command_id, const char *command_data)
+{
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    esp_err_t err = esp_matter::controller::send_invoke_cluster_command(
+        node_id, endpoint_id, cluster_id, command_id, command_data);
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "Invoke node 0x%llx cluster 0x%lx cmd 0x%lx failed: 0x%x",
+                 (unsigned long long)node_id, (unsigned long)cluster_id, (unsigned long)command_id, err);
+    return err;
+}
+
+static std::string build_groupkeymap_json(const std::vector<group_key_map_t> &entries)
+{
+    char buf[64];
+    std::string json = "{\"0:ARR-OBJ\":[";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        snprintf(buf, sizeof(buf), "%s{\"1:U16\":%u,\"2:U16\":%u}",
+                 i ? "," : "", (unsigned)entries[i].group_id, (unsigned)entries[i].keyset_id);
+        json += buf;
+    }
+    json += "]}";
+    return json;
+}
+
+// Serializes a full ACL list. Subjects are emitted as quoted decimal strings
+// (CASE = node ids, Group = group ids) to avoid 64-bit precision loss.
+static std::string build_acl_entries_json(const std::vector<acl_entry_t> &entries)
+{
+    std::string json = "{\"0:ARR-OBJ\":[";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const acl_entry_t &e = entries[i];
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s{\"1:U8\":%u,\"2:U8\":%u,\"3:ARR-U64\":[",
+                 i ? "," : "", (unsigned)e.privilege, (unsigned)e.auth_mode);
+        json += buf;
+        for (size_t j = 0; j < e.subjects.size(); ++j) {
+            snprintf(buf, sizeof(buf), "%s\"%llu\"", j ? "," : "", (unsigned long long)e.subjects[j]);
+            json += buf;
+        }
+        json += "],\"4:NULL\":null}";
+    }
+    json += "]}";
+    return json;
+}
+
+// Installs the group epoch key on a node (KeySetWrite) and ensures its GroupKeyMap
+// maps group_id -> keyset_id. Shared by add_group_member and create_group_binding.
+static esp_err_t install_group_key_on_node(uint64_t node_id, uint16_t group_id, uint16_t keyset_id)
+{
+    uint8_t key[kEpochKeyLen];
+    if (!keyset_key_load(keyset_id, key)) {
+        ESP_LOGE(TAG, "No stored epoch key for keyset %u", (unsigned)keyset_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+    unsigned char b64[32];
+    size_t b64_len = 0;
+    if (mbedtls_base64_encode(b64, sizeof(b64), &b64_len, key, kEpochKeyLen) != 0)
+        return ESP_FAIL;
+
+    // KeySetWrite (GroupKeySetStruct): EpochKey0 = base64 octstr, EpochStartTime0 >= 1,
+    // remaining epoch slots null. Policy = TrustFirst.
+    char data[192];
+    snprintf(data, sizeof(data),
+             "{\"0:OBJ\":{\"0:U16\":%u,\"1:U8\":%u,\"2:BYT\":\"%.*s\",\"3:U64\":\"1\","
+             "\"4:NULL\":null,\"5:NULL\":null,\"6:NULL\":null,\"7:NULL\":null}}",
+             (unsigned)keyset_id, (unsigned)kGroupKeyPolicyTrustFirst, (int)b64_len, b64);
+    ESP_LOGI(TAG, "KeySetWrite keyset %u on node 0x%llx: %s",
+             (unsigned)keyset_id, (unsigned long long)node_id, data);
+    esp_err_t err = blocking_invoke_cmd(node_id, 0, kGroupKeyMgmtCluster, kKeySetWriteCommand, data);
+    if (err != ESP_OK)
+        return err;
+
+    // GroupKeyMap read-modify-write so existing maps on the node are preserved.
+    err = blocking_read_attr(node_id, 0, kGroupKeyMgmtCluster, kGroupKeyMapAttribute,
+                             on_groupkeymap_read_attr);
+    std::vector<group_key_map_t> entries = (err == ESP_OK) ? s_group_key_map : std::vector<group_key_map_t>{};
+    bool exists = false;
+    for (const auto &e : entries)
+        if (e.group_id == group_id) { exists = true; break; }
+    if (!exists)
+        entries.push_back({group_id, keyset_id});
+    std::string json = build_groupkeymap_json(entries);
+    ESP_LOGI(TAG, "GroupKeyMap write on node 0x%llx: %s",
+             (unsigned long long)node_id, json.c_str());
+    return blocking_write_attr(node_id, 0, kGroupKeyMgmtCluster, kGroupKeyMapAttribute, json.c_str());
+}
+
+esp_err_t matter_controller_create_group(uint16_t group_id, const char *name)
+{
+    // Lazily provision the single shared application keyset: generate + persist a
+    // random epoch key the first time, reuse it forever after (regenerating would
+    // invalidate the key already installed on existing members).
+    uint8_t key[kEpochKeyLen];
+    if (!keyset_key_load(kAppKeysetId, key)) {
+        esp_fill_random(key, sizeof(key));
+        esp_err_t store_err = keyset_key_store(kAppKeysetId, key);
+        if (store_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to persist shared epoch key");
+            return store_err;
+        }
+    }
+    char key_hex[2 * kEpochKeyLen + 1];
+    bytes_to_hex(key, kEpochKeyLen, key_hex);
+
+    char name_buf[32];
+    snprintf(name_buf, sizeof(name_buf), "%s", (name && *name) ? name : "Group");
+
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+
+    esp_err_t err = esp_matter::controller::group_settings::add_keyset(kAppKeysetId, kGroupKeyPolicyTrustFirst, 0, key_hex);
+    
+    if (err == ESP_OK)
+    {
+        err = esp_matter::controller::group_settings::add_group(name_buf, group_id);
+    }
+
+    if (err == ESP_OK)
+    {
+        err = esp_matter::controller::group_settings::bind_keyset(group_id, kAppKeysetId);
+    }
+    
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "create_group %u failed: 0x%x", (unsigned)group_id, err);
+    else
+        ESP_LOGI(TAG, "Created group %u (shared keyset %u)", (unsigned)group_id, (unsigned)kAppKeysetId);
+    return err;
+}
+
+esp_err_t matter_controller_delete_group(uint16_t group_id)
+{
+    // Unbind this group from the shared keyset and drop the group info, but keep
+    // the shared keyset itself — the other groups still reference it.
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    esp_matter::controller::group_settings::unbind_keyset(group_id, kAppKeysetId);
+    esp_matter::controller::group_settings::remove_group(group_id);
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    ESP_LOGI(TAG, "Deleted group %u", (unsigned)group_id);
+    return ESP_OK;
+}
+
+esp_err_t matter_controller_add_group_member(uint64_t node_id, uint16_t group_id, const char *name)
+{
+    ESP_LOGI(TAG, "add_group_member: node 0x%llx -> group %u (shared keyset %u)",
+             (unsigned long long)node_id, (unsigned)group_id, (unsigned)kAppKeysetId);
+
+    // 1. Install the shared group key + GroupKeyMap on the member.
+    esp_err_t err = install_group_key_on_node(node_id, group_id, kAppKeysetId);
+    if (err != ESP_OK)
+        return err;
+
+    // 2. Grant the group Operate on the member's ACL (read-modify-write of the full
+    //    list). The controller's Administer/CASE entry is reconstructed canonically;
+    //    every other existing entry is preserved.
+    err = blocking_read_attr(node_id, 0, kAclCluster, kAclAttribute, on_acl_read_full);
+    if (err != ESP_OK)
+        return err;
+    std::vector<acl_entry_t> entries;
+    entries.push_back({kAclPrivilegeAdminister, kAclAuthModeCase, {kControllerNodeId}});
+    bool group_present = false;
+    for (const acl_entry_t &e : s_acl_entries) {
+        // Drop invalid/empty entries (privilege or auth mode 0) so we never echo
+        // garbage back — the device would reject the whole list write, and a list
+        // write replaces everything, so this also cleans up any prior corruption.
+        if (e.privilege == 0 || e.auth_mode == 0)
+            continue;
+        if (e.privilege == kAclPrivilegeAdminister && e.auth_mode == kAclAuthModeCase)
+            continue;  // folded into the canonical controller entry above
+        if (e.privilege == kAclPrivilegeOperate && e.auth_mode == kAclAuthModeGroup) {
+            acl_entry_t g = e;
+            if (std::find(g.subjects.begin(), g.subjects.end(), group_id) == g.subjects.end())
+                g.subjects.push_back(group_id);
+            entries.push_back(std::move(g));
+            group_present = true;
+        } else {
+            entries.push_back(e);
+        }
+    }
+    if (!group_present)
+        entries.push_back({kAclPrivilegeOperate, kAclAuthModeGroup, {group_id}});
+    std::string acl_json = build_acl_entries_json(entries);
+    ESP_LOGI(TAG, "add_group_member: writing ACL to node 0x%llx (%u entries): %s",
+             (unsigned long long)node_id, (unsigned)entries.size(), acl_json.c_str());
+    err = blocking_write_attr(node_id, 0, kAclCluster, kAclAttribute, acl_json.c_str());
+    if (err != ESP_OK)
+        return err;
+
+    // 3. AddGroup on the device's application (On/Off) endpoint.
+    uint16_t endpoint = 1;
+    device_manager_get_onoff_endpoint(node_id, &endpoint);
+    char data[64];
+    snprintf(data, sizeof(data), "{\"0:U16\":%u,\"1:STR\":\"%s\"}",
+             (unsigned)group_id, (name && *name) ? name : "");
+    err = blocking_invoke_cmd(node_id, endpoint, kGroupsCluster, kAddGroupCommand, data);
+    if (err != ESP_OK)
+        return err;
+
+    ESP_LOGI(TAG, "Added node 0x%llx to group %u", (unsigned long long)node_id, (unsigned)group_id);
+    return ESP_OK;
+}
+
+esp_err_t matter_controller_remove_group_member(uint64_t node_id, uint16_t group_id)
+{
+    // 1. RemoveGroup on the application endpoint.
+    uint16_t endpoint = 1;
+    device_manager_get_onoff_endpoint(node_id, &endpoint);
+    char data[32];
+    snprintf(data, sizeof(data), "{\"0:U16\":%u}", (unsigned)group_id);
+    blocking_invoke_cmd(node_id, endpoint, kGroupsCluster, kRemoveGroupCommand, data);
+
+    // 2. Drop the group's GroupKeyMap entry (best effort RMW).
+    if (blocking_read_attr(node_id, 0, kGroupKeyMgmtCluster, kGroupKeyMapAttribute,
+                           on_groupkeymap_read_attr) == ESP_OK) {
+        std::vector<group_key_map_t> entries;
+        for (const auto &e : s_group_key_map)
+            if (e.group_id != group_id)
+                entries.push_back(e);
+        std::string json = build_groupkeymap_json(entries);
+        blocking_write_attr(node_id, 0, kGroupKeyMgmtCluster, kGroupKeyMapAttribute, json.c_str());
+    }
+
+    // 3. Drop the group id from the ACL Group/Operate entry (best effort RMW).
+    if (blocking_read_attr(node_id, 0, kAclCluster, kAclAttribute, on_acl_read_full) == ESP_OK) {
+        std::vector<acl_entry_t> entries;
+        entries.push_back({kAclPrivilegeAdminister, kAclAuthModeCase, {kControllerNodeId}});
+        for (const acl_entry_t &e : s_acl_entries) {
+            if (e.privilege == 0 || e.auth_mode == 0)
+                continue;  // drop invalid/empty entries (see add_group_member)
+            if (e.privilege == kAclPrivilegeAdminister && e.auth_mode == kAclAuthModeCase)
+                continue;
+            acl_entry_t out = e;
+            if (e.privilege == kAclPrivilegeOperate && e.auth_mode == kAclAuthModeGroup) {
+                out.subjects.clear();
+                for (uint64_t s : e.subjects)
+                    if (s != group_id)
+                        out.subjects.push_back(s);
+                if (out.subjects.empty())
+                    continue;  // drop an empty group entry
+            }
+            entries.push_back(std::move(out));
+        }
+        std::string acl_json = build_acl_entries_json(entries);
+        blocking_write_attr(node_id, 0, kAclCluster, kAclAttribute, acl_json.c_str());
+    }
+
+    ESP_LOGI(TAG, "Removed node 0x%llx from group %u", (unsigned long long)node_id, (unsigned)group_id);
+    return ESP_OK;
+}
+
+esp_err_t matter_controller_create_group_binding(uint64_t switch_node_id, uint16_t switch_endpoint,
+                                                 uint16_t group_id)
+{
+    if (switch_endpoint == 0 &&
+        device_manager_get_switch_endpoint(switch_node_id, &switch_endpoint) != ESP_OK) {
+        ESP_LOGW(TAG, "No switch endpoint for node 0x%llx", (unsigned long long)switch_node_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // The switch sends groupcast, so it needs the shared group key installed too.
+    esp_err_t err = install_group_key_on_node(switch_node_id, group_id, kAppKeysetId);
+    if (err != ESP_OK)
+        return err;
+
+    // Add a group target to the switch's Binding list (read-modify-write).
+    err = blocking_read_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
+                             on_binding_read_attr);
+    std::vector<binding_target_t> targets = (err == ESP_OK) ? s_binding_entries : std::vector<binding_target_t>{};
+    bool exists = false;
+    for (const auto &t : targets)
+        if (t.is_group && t.group == group_id && t.cluster == kOnOffCluster) { exists = true; break; }
+    if (!exists) {
+        binding_target_t t = {0, 0, kOnOffCluster, group_id, true};
+        targets.push_back(t);
+    }
+    std::string binding_json = build_binding_json(targets);
+    err = blocking_write_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
+                              binding_json.c_str());
+    if (err != ESP_OK)
+        return err;
+
+    ESP_LOGI(TAG, "Created group binding switch 0x%llx ep%u -> group %u",
+             (unsigned long long)switch_node_id, switch_endpoint, (unsigned)group_id);
+    return ESP_OK;
+}
+
+esp_err_t matter_controller_delete_group_binding(uint64_t switch_node_id, uint16_t switch_endpoint,
+                                                 uint16_t group_id)
+{
+    if (switch_endpoint == 0 &&
+        device_manager_get_switch_endpoint(switch_node_id, &switch_endpoint) != ESP_OK)
+        return ESP_ERR_NOT_FOUND;
+
+    if (blocking_read_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
+                           on_binding_read_attr) == ESP_OK) {
+        std::vector<binding_target_t> targets;
+        for (const auto &t : s_binding_entries)
+            if (!(t.is_group && t.group == group_id && t.cluster == kOnOffCluster))
+                targets.push_back(t);
+        std::string binding_json = build_binding_json(targets);
+        blocking_write_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
+                            binding_json.c_str());
+    }
+
+    ESP_LOGI(TAG, "Deleted group binding switch 0x%llx -> group %u",
+             (unsigned long long)switch_node_id, (unsigned)group_id);
+    return ESP_OK;
+}
+
+esp_err_t matter_controller_reset_node_groups(uint64_t node_id)
+{
+    ESP_LOGI(TAG, "reset_node_groups: clearing all group state on node 0x%llx",
+             (unsigned long long)node_id);
+
+    // 1. Empty the GroupKeyMap so no group references a keyset.
+    std::string empty_map = build_groupkeymap_json({});
+    blocking_write_attr(node_id, 0, kGroupKeyMgmtCluster, kGroupKeyMapAttribute, empty_map.c_str());
+
+    // 2. Remove every app keyset (the IPK, keyset 0, is left intact). KeySetRemove of a
+    //    non-existent id just returns NOT_FOUND, which is harmless here.
+    for (uint16_t ks = 1; ks <= kMaxGroupKeysetScan; ++ks) {
+        char data[32];
+        snprintf(data, sizeof(data), "{\"0:U16\":%u}", (unsigned)ks);
+        blocking_invoke_cmd(node_id, 0, kGroupKeyMgmtCluster, kKeySetRemoveCommand, data);
+    }
+
+    // 3. RemoveAllGroups on the application endpoint (Groups cluster, no fields).
+    uint16_t endpoint = 1;
+    device_manager_get_onoff_endpoint(node_id, &endpoint);
+    blocking_invoke_cmd(node_id, endpoint, kGroupsCluster, kRemoveAllGroupsCommand, "{}");
+
+    ESP_LOGI(TAG, "reset_node_groups: done for node 0x%llx", (unsigned long long)node_id);
+    return ESP_OK;
+}
+
+esp_err_t matter_controller_reset_acl(uint64_t node_id)
+{
+    // Rebuild the ACL with only the controller's Administer/CASE entry (no Operate
+    // subjects), which replaces the whole list and drops everything else.
+    std::string acl_json = build_acl_json(kControllerNodeId, {});
+    ESP_LOGI(TAG, "reset_acl: writing ACL to node 0x%llx: %s",
+             (unsigned long long)node_id, acl_json.c_str());
+    esp_err_t err = blocking_write_attr(node_id, 0, kAclCluster, kAclAttribute, acl_json.c_str());
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "reset_acl: write to node 0x%llx failed: 0x%x", (unsigned long long)node_id, err);
+    return err;
+}
+
+esp_err_t matter_controller_reset_bindings(uint64_t node_id)
+{
+    // The Binding cluster lives on the device's switch endpoint; devices without one
+    // hold no bindings, so there is nothing to clear.
+    uint16_t endpoint = 0;
+    if (device_manager_get_switch_endpoint(node_id, &endpoint) != ESP_OK) {
+        ESP_LOGI(TAG, "reset_bindings: node 0x%llx has no switch endpoint, nothing to clear",
+                 (unsigned long long)node_id);
+        return ESP_OK;
+    }
+    // Empty binding list replaces the whole table.
+    std::string binding_json = build_binding_json({});
+    ESP_LOGI(TAG, "reset_bindings: clearing Binding table on node 0x%llx ep%u",
+             (unsigned long long)node_id, endpoint);
+    esp_err_t err = blocking_write_attr(node_id, endpoint, kBindingCluster, kBindingAttribute,
+                                        binding_json.c_str());
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "reset_bindings: write to node 0x%llx failed: 0x%x",
+                 (unsigned long long)node_id, err);
+    return err;
+}
+
+esp_err_t matter_controller_groupcast_toggle(uint16_t group_id)
+{
+    // A Matter group node id is 0xFFFFFFFFFFFF0000 | group_id (chip::IsGroupId range);
+    // send_invoke_cluster_command routes this as a groupcast. Endpoint is ignored.
+    // Toggle is state-independent and matches what the bound switch sends.
+    uint64_t dest = 0xFFFFFFFFFFFF0000ULL | (uint64_t)group_id;
+    ESP_LOGI(TAG, "groupcast OnOff Toggle to group %u", (unsigned)group_id);
+    return blocking_invoke_cmd(dest, 0, kOnOffCluster, kOnOffCmdToggle, "{}");
 }
 
 // ---------------------------------------------------------------------------
@@ -812,18 +1557,23 @@ esp_err_t matter_controller_commission_on_network(const char *onboarding_payload
         return ESP_ERR_INVALID_ARG;
     }
 
-    s_commission_ctx.done = xSemaphoreCreateBinary();
+    // Persistent semaphore (created once): the commissioning success/failure callback may fire
+    // after this function has returned (slow attestation/revocation), so it must not be deleted.
+    if (!s_commission_ctx.done) {
+        s_commission_ctx.done = xSemaphoreCreateBinary();
+        if (!s_commission_ctx.done)
+            return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreTake(s_commission_ctx.done, 0);  // drain any stale signal from a prior attempt
     s_commission_ctx.result = CHIP_NO_ERROR;
-    if (!s_commission_ctx.done)
-        return ESP_ERR_NO_MEM;
 
     chip::NodeId node_id = matter_controller_allocate_node_id();
 
-    esp_matter::controller::pairing_command_callbacks_t callbacks = {
+    matter_controller::controller::pairing_command_callbacks_t callbacks = {
         .commissioning_success_callback = on_commissioning_success_callback,
         .commissioning_failure_callback = on_commissioning_failure_callback,
     };
-    esp_matter::controller::pairing_command::get_instance().set_callbacks(callbacks);
+    matter_controller::controller::pairing_command::get_instance().set_callbacks(callbacks);
 
     ESP_LOGI(TAG, "Attempting to commission node %llu", node_id);
 
@@ -836,98 +1586,38 @@ esp_err_t matter_controller_commission_on_network(const char *onboarding_payload
 
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     //esp_matter::controller::pairing_code(node_id, onboarding_payload);
-    esp_matter::controller::pairing_on_network(node_id, payload.setUpPINCode);
+    matter_controller::controller::pairing_on_network(node_id, payload.setUpPINCode);
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 
-    if (xSemaphoreTake(s_commission_ctx.done, pdMS_TO_TICKS(60000)) != pdTRUE) {
+    // Attestation (DCL PAA lookup + revocation check) can take well over a minute on an
+    // offline controller, so allow a generous window before giving up.
+    if (xSemaphoreTake(s_commission_ctx.done, pdMS_TO_TICKS(180000)) != pdTRUE) {
         ESP_LOGE(TAG, "Commissioning timed out");
-        vSemaphoreDelete(s_commission_ctx.done);
         return ESP_ERR_TIMEOUT;
     }
 
     CHIP_ERROR result = s_commission_ctx.result;
-    vSemaphoreDelete(s_commission_ctx.done);
 
     if (result == CHIP_NO_ERROR) {
+        ESP_LOGI(TAG, "Processing new node %llu", node_id);
+
         if (node_id_out)
             *node_id_out = (uint64_t)node_id;
         node_list_add(node_id);
-        interrogate_node(node_id);
-        return ESP_OK;
-    }
 
-    return ESP_FAIL;
-}
+        // Save the device and its canvas node immediately, so it is recorded even if
+        // interrogation is slow or fails. Interrogation then enriches it (vendor/product/
+        // device type/endpoints) and updates the saved node when it completes.
+        device_manager_add_device(node_id);
+        device_manager_persist();
+        add_canvas_node(node_id, 0);  // device type unknown until interrogation enriches it
 
-// ---------------------------------------------------------------------------
-// Blocking BLE + Wi-Fi commissioning
-// ---------------------------------------------------------------------------
-
-// Hardcoded Wi-Fi credentials handed to devices over BLE during commissioning.
-static constexpr char kCommissioningSsid[]     = "JARVIS";
-static constexpr char kCommissioningPassword[] = "pmuvevfu";
-
-esp_err_t matter_controller_commission_ble_wifi(const char *onboarding_payload, uint64_t *node_id_out)
-{
-    chip::SetupPayload payload;
-    CHIP_ERROR parse_err;
-
-    if (strncmp(onboarding_payload, "MT:", 3) == 0)
-        parse_err = chip::QRCodeSetupPayloadParser(onboarding_payload).populatePayload(payload);
-    else
-        parse_err = chip::ManualSetupPayloadParser(onboarding_payload).populatePayload(payload);
-
-    if (parse_err != CHIP_NO_ERROR) {
-        ESP_LOGE(TAG, "Failed to parse onboarding payload: %" CHIP_ERROR_FORMAT, parse_err.Format());
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    s_commission_ctx.done = xSemaphoreCreateBinary();
-    s_commission_ctx.result = CHIP_NO_ERROR;
-    if (!s_commission_ctx.done)
-        return ESP_ERR_NO_MEM;
-
-    chip::NodeId node_id = matter_controller_allocate_node_id();
-
-    home_energy_manager::controller::pairing_command_callbacks_t callbacks = {
-        .commissioning_success_callback = on_commissioning_success_callback,
-        .commissioning_failure_callback = on_commissioning_failure_callback,
-    };
-    home_energy_manager::controller::pairing_command::get_instance().set_callbacks(callbacks);
-
-    ESP_LOGI(TAG, "Attempting BLE+Wi-Fi commission of node %llu onto SSID '%s'",
-             (unsigned long long)node_id, kCommissioningSsid);
-
-    chip::DeviceLayer::PlatformMgr().LockChipStack();
-    esp_err_t pair_err = home_energy_manager::controller::pairing_command::pairing_code_wifi(
-        node_id, kCommissioningSsid, kCommissioningPassword, onboarding_payload);
-    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
-
-    if (pair_err != ESP_OK) {
-        ESP_LOGE(TAG, "pairing_code_wifi failed to start: 0x%x", pair_err);
-        vSemaphoreDelete(s_commission_ctx.done);
-        return pair_err;
-    }
-
-    if (xSemaphoreTake(s_commission_ctx.done, pdMS_TO_TICKS(120000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Commissioning timed out");
-        vSemaphoreDelete(s_commission_ctx.done);
-        return ESP_ERR_TIMEOUT;
-    }
-
-    CHIP_ERROR result = s_commission_ctx.result;
-    vSemaphoreDelete(s_commission_ctx.done);
-
-    if (result == CHIP_NO_ERROR) {
-        if (node_id_out)
-            *node_id_out = (uint64_t)node_id;
-        node_list_add(node_id);
-        // Interrogate and wait until devices.json / nodes.json are written so the
-        // HTTP response only returns once the device is fully recorded.
+        if (s_interrogation_done)
+            xSemaphoreTake(s_interrogation_done, 0);
         interrogate_node(node_id);
         if (s_interrogation_done &&
             xSemaphoreTake(s_interrogation_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
-            ESP_LOGW(TAG, "Interrogation did not finish in time for node 0x%llx",
+            ESP_LOGW(TAG, "Interrogation did not finish in time for node 0x%llx; saved with minimal info",
                      (unsigned long long)node_id);
         }
         return ESP_OK;
@@ -995,18 +1685,6 @@ esp_err_t matter_controller_start(void)
         ESP_LOGE(TAG, "esp_matter::start failed: 0x%x", err);
         return err;
     }
-
-#if CONFIG_ENABLE_ETHERNET_TELEMETRY
-    // Controller mode disables the Matter server, so the NetworkCommissioning
-    // cluster never initialises the Ethernet driver automatically. Call it directly.
-    CHIP_ERROR eth_err = chip::DeviceLayer::NetworkCommissioning::ESPEthernetDriver::GetInstance().Init(nullptr);
-    if (eth_err != CHIP_NO_ERROR) {
-        ESP_LOGE(TAG, "ESPEthernetDriver::Init failed: %" CHIP_ERROR_FORMAT, eth_err.Format());
-        return ESP_FAIL;
-    }
-#else
-    ESP_LOGI(TAG, "W5500 Ethernet disabled (CONFIG_ENABLE_ETHERNET_TELEMETRY=n)");
-#endif
 
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     err = esp_matter::controller::matter_controller_client::get_instance().init(112233, 1, 5580);

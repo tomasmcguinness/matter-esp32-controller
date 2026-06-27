@@ -25,7 +25,7 @@ using chip::SessionHandle;
 using chip::Controller::CommissioningParameters;
 using chip::Messaging::ExchangeManager;
 
-namespace home_energy_manager
+namespace matter_controller
 {
     namespace controller
     {
