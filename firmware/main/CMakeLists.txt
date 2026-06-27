@@ -10,7 +10,7 @@ idf_component_register(SRCS
         "thread_credentials.cpp"
         "thread_meshcop.cpp"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES json esp_eth esp_netif ethernet_init driver nvs_flash esp_http_server mdns esp_matter esp_matter_controller mbedtls lwip esp_timer
+    PRIV_REQUIRES json esp_eth esp_netif driver nvs_flash esp_http_server mdns esp_matter esp_matter_controller mbedtls lwip esp_timer
 )
 
 add_custom_target(react_build
