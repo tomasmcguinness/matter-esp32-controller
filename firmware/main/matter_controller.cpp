@@ -1085,12 +1085,12 @@ static esp_err_t blocking_invoke_cmd(uint64_t node_id, uint16_t endpoint_id, uin
                                      uint32_t command_id, const char *command_data)
 {
     chip::DeviceLayer::PlatformMgr().LockChipStack();
-    esp_err_t err = esp_matter::controller::send_invoke_cluster_command(
-        node_id, endpoint_id, cluster_id, command_id, command_data);
+    esp_err_t err = esp_matter::controller::send_invoke_cluster_command(node_id, endpoint_id, cluster_id, command_id, command_data);
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
     if (err != ESP_OK)
-        ESP_LOGE(TAG, "Invoke node 0x%llx cluster 0x%lx cmd 0x%lx failed: 0x%x",
-                 (unsigned long long)node_id, (unsigned long)cluster_id, (unsigned long)command_id, err);
+    {
+        ESP_LOGE(TAG, "Invoke node 0x%llx cluster 0x%lx cmd 0x%lx failed: 0x%x", (unsigned long long)node_id, (unsigned long)cluster_id, (unsigned long)command_id, err);
+    }
     return err;
 }
 
@@ -1149,8 +1149,7 @@ static esp_err_t install_group_key_on_node(uint64_t node_id, uint16_t group_id, 
              "{\"0:OBJ\":{\"0:U16\":%u,\"1:U8\":%u,\"2:BYT\":\"%.*s\",\"3:U64\":\"1\","
              "\"4:NULL\":null,\"5:NULL\":null,\"6:NULL\":null,\"7:NULL\":null}}",
              (unsigned)keyset_id, (unsigned)kGroupKeyPolicyTrustFirst, (int)b64_len, b64);
-    ESP_LOGI(TAG, "KeySetWrite keyset %u on node 0x%llx: %s",
-             (unsigned)keyset_id, (unsigned long long)node_id, data);
+    ESP_LOGI(TAG, "KeySetWrite keyset %u on node 0x%llx: %s", (unsigned)keyset_id, (unsigned long long)node_id, data);
     esp_err_t err = blocking_invoke_cmd(node_id, 0, kGroupKeyMgmtCluster, kKeySetWriteCommand, data);
     if (err != ESP_OK)
         return err;
@@ -1165,8 +1164,7 @@ static esp_err_t install_group_key_on_node(uint64_t node_id, uint16_t group_id, 
     if (!exists)
         entries.push_back({group_id, keyset_id});
     std::string json = build_groupkeymap_json(entries);
-    ESP_LOGI(TAG, "GroupKeyMap write on node 0x%llx: %s",
-             (unsigned long long)node_id, json.c_str());
+    ESP_LOGI(TAG, "GroupKeyMap write on node 0x%llx: %s", (unsigned long long)node_id, json.c_str());
     return blocking_write_attr(node_id, 0, kGroupKeyMgmtCluster, kGroupKeyMapAttribute, json.c_str());
 }
 
@@ -1245,11 +1243,6 @@ esp_err_t matter_controller_add_group_member(uint64_t node_id, uint16_t group_id
     entries.push_back({kAclPrivilegeAdminister, kAclAuthModeCase, {kControllerNodeId}});
     bool group_present = false;
     for (const acl_entry_t &e : s_acl_entries) {
-        // Drop invalid/empty entries (privilege or auth mode 0) so we never echo
-        // garbage back — the device would reject the whole list write, and a list
-        // write replaces everything, so this also cleans up any prior corruption.
-        if (e.privilege == 0 || e.auth_mode == 0)
-            continue;
         if (e.privilege == kAclPrivilegeAdminister && e.auth_mode == kAclAuthModeCase)
             continue;  // folded into the canonical controller entry above
         if (e.privilege == kAclPrivilegeOperate && e.auth_mode == kAclAuthModeGroup) {
