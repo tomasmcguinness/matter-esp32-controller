@@ -1357,6 +1357,20 @@ esp_err_t matter_controller_create_group_binding(uint64_t switch_node_id, uint16
     if (err != ESP_OK)
         return err;
 
+    uint16_t groups_endpoint = 0;
+    if (device_manager_get_onoff_endpoint(switch_node_id, &groups_endpoint) == ESP_OK) {
+        char gdata[64];
+        snprintf(gdata, sizeof(gdata), "{\"0:U16\":%u,\"1:STR\":\"\"}", (unsigned)group_id);
+        esp_err_t aerr = blocking_invoke_cmd(switch_node_id, groups_endpoint, kGroupsCluster,
+                                             kAddGroupCommand, gdata);
+        if (aerr != ESP_OK)
+            ESP_LOGW(TAG, "AddGroup on switch 0x%llx ep%u failed: 0x%x (group send may fail NOT_FOUND)",
+                     (unsigned long long)switch_node_id, groups_endpoint, aerr);
+    } else {
+        ESP_LOGW(TAG, "Switch 0x%llx has no Groups-server endpoint; outgoing group send will fail NOT_FOUND",
+                 (unsigned long long)switch_node_id);
+    }
+
     ESP_LOGI(TAG, "Created group binding switch 0x%llx ep%u -> group %u",
              (unsigned long long)switch_node_id, switch_endpoint, (unsigned)group_id);
     return ESP_OK;
@@ -1378,6 +1392,15 @@ esp_err_t matter_controller_delete_group_binding(uint64_t switch_node_id, uint16
         std::string binding_json = build_binding_json(targets);
         blocking_write_attr(switch_node_id, switch_endpoint, kBindingCluster, kBindingAttribute,
                             binding_json.c_str());
+    }
+
+    // Undo the GroupInfo membership that create_group_binding added (RemoveGroup on the
+    // switch's Groups-server endpoint), so the switch's local load no longer follows it.
+    uint16_t groups_endpoint = 0;
+    if (device_manager_get_onoff_endpoint(switch_node_id, &groups_endpoint) == ESP_OK) {
+        char gdata[32];
+        snprintf(gdata, sizeof(gdata), "{\"0:U16\":%u}", (unsigned)group_id);
+        blocking_invoke_cmd(switch_node_id, groups_endpoint, kGroupsCluster, kRemoveGroupCommand, gdata);
     }
 
     ESP_LOGI(TAG, "Deleted group binding switch 0x%llx -> group %u",
