@@ -105,6 +105,13 @@ export const handlers = [
     return HttpResponse.json({})
   }),
 
+  http.put('/api/devices/:nodeId', async ({ params, request }) => {
+    const nodeId = Number(params.nodeId)
+    const body = (await request.json()) as { name?: string }
+    devices = devices.map(d => d.nodeId === nodeId ? { ...d, name: body.name ?? '' } : d)
+    return HttpResponse.json({})
+  }),
+
   http.post('/api/reinterview/:nodeId', async ({ params }) => {
     const nodeId = Number(params.nodeId)
     // Simulate the device being re-read; just confirm it still exists.
@@ -154,6 +161,37 @@ export const handlers = [
       entries: [
         { node: String(0x1000 + (nodeId % 16)), endpoint: 1, cluster: 6 },
       ],
+    })
+  }),
+
+  http.get('/api/groupstate/:nodeId', async ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    if (!devices.some(d => d.nodeId === nodeId)) {
+      return new HttpResponse('Not found', { status: 404 })
+    }
+    // Delay so the modal's loading indicator is visible during dev.
+    await new Promise(resolve => setTimeout(resolve, 400))
+    return HttpResponse.json({
+      groupKeyMap: [{ group: 4, keyset: 1 }],
+      groupTable: [{ group: 4, endpoints: [1], name: '' }],
+    })
+  }),
+
+  http.get('/api/threadinfo/:nodeId', async ({ params }) => {
+    const nodeId = Number(params.nodeId)
+    if (!devices.some(d => d.nodeId === nodeId)) {
+      return new HttpResponse('Not found', { status: 404 })
+    }
+    // Delay so the modal's loading indicator is visible during dev.
+    await new Promise(resolve => setTimeout(resolve, 400))
+    // Alternate two Thread networks by node id so the split is visible in dev.
+    const onOtbr = nodeId % 2 === 1
+    return HttpResponse.json({
+      networkName: onOtbr ? 'my-otbr' : 'HomePod-Thread',
+      extendedPanId: onOtbr ? '0xDEAD00BEEF00CAFE' : '0x1122334455667788',
+      panId: onOtbr ? 0x1234 : 0xABCD,
+      channel: onOtbr ? 15 : 25,
+      routingRole: onOtbr ? 5 : 3,
     })
   }),
 

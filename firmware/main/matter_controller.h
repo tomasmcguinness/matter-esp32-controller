@@ -32,6 +32,16 @@ esp_err_t matter_controller_get_acl(uint64_t node_id, char **json_out);
 // [ { "node":"..", "endpoint", "cluster" } ] } that the caller must free(). Devices
 // with no switch endpoint return an empty entries list.
 esp_err_t matter_controller_get_binding_table(uint64_t node_id, char **json_out);
+// Read a device's group state (cluster 0x003F, EP0): the GroupKeyMap (group->keyset)
+// and GroupTable (group->member endpoints). On success *json_out is set to a malloc'd
+// JSON string { "groupKeyMap":[{"group","keyset"}], "groupTable":[{"group","endpoints":
+// [..],"name"}] } that the caller must free(). For diffing group members.
+esp_err_t matter_controller_get_group_state(uint64_t node_id, char **json_out);
+// Read a device's Thread Network Diagnostics (cluster 0x0035, EP0): which Thread network
+// it is on and its mesh role. On success *json_out is a malloc'd JSON string { "networkName",
+// "extendedPanId", "panId", "channel", "routingRole" } (absent fields null) the caller must
+// free(). Returns ESP_ERR_NOT_FOUND if the device reports no Thread diagnostics.
+esp_err_t matter_controller_get_thread_info(uint64_t node_id, char **json_out);
 // Create/remove a Matter binding so a switch directly controls a light's OnOff cluster.
 // Writes the light's ACL (granting the switch Operate) and the switch's Binding attribute.
 // Pass 0 for an endpoint to auto-resolve it from the device manager.

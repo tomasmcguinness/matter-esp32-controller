@@ -555,10 +555,13 @@ function Canvas() {
       fetch('/api/devices').then(r => r.ok ? r.json() : { devices: [] }).catch(() => ({ devices: [] })) as Promise<{ devices: CommissionedDevice[] }>,
     ])
       .then(([data, deviceData]) => {
-        // Map nodeId -> endpoint breakdown so each canvas node can render its endpoints.
+        // Map nodeId -> endpoint breakdown so each canvas node can render its endpoints,
+        // and nodeId -> custom device name (set on the Devices tab) for the node label.
         const epByNode = new Map<number, DeviceEndpoint[]>()
+        const nameByNode = new Map<number, string>()
         for (const d of deviceData.devices ?? []) {
           if (d.endpoints) epByNode.set(d.nodeId, d.endpoints)
+          if (d.name) nameByNode.set(d.nodeId, d.name)
         }
 
         // First pass: group sub-flows (parents must precede their children).
@@ -595,7 +598,9 @@ function Canvas() {
             position: { x: n.x, y: n.y },
             draggable: true,
             data: {
-              label: (n.settings?.label as string) ?? n.id,
+              // Prefer the custom device name from /api/devices, then any saved
+              // canvas label, then the node id.
+              label: nameByNode.get(nodeId) ?? (n.settings?.label as string) ?? n.id,
               nodeId,
               deviceType: n.settings?.deviceType as number ?? 0,
               endpoints: epByNode.get(nodeId),

@@ -207,6 +207,53 @@ static esp_err_t device_delete_handler(httpd_req_t *req)
 }
 
 // ---------------------------------------------------------------------------
+// PUT /api/devices/:nodeId  -> set the device's friendly name
+// ---------------------------------------------------------------------------
+
+static esp_err_t device_name_put_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    char body[MAX_POST_BODY + 1];
+    if (recv_body(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad JSON");
+        return ESP_FAIL;
+    }
+    cJSON *nm = cJSON_GetObjectItemCaseSensitive(root, "name");
+    if (!cJSON_IsString(nm)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing name");
+        return ESP_FAIL;
+    }
+    // An empty string clears the custom name (heading reverts to vendor/product).
+    esp_err_t err = device_manager_set_device_name(node_id, nm->valuestring, strlen(nm->valuestring));
+    cJSON_Delete(root);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Unknown device");
+        return ESP_FAIL;
+    }
+    device_manager_persist();
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{}");
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/reinterview/:nodeId  -> re-read the device's structure
 // ---------------------------------------------------------------------------
 
@@ -312,6 +359,74 @@ static esp_err_t bindingtable_get_handler(httpd_req_t *req)
     esp_err_t err = matter_controller_get_binding_table(node_id, &json);
     if (err != ESP_OK || !json) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read binding table");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t send_err = httpd_resp_sendstr(req, json);
+    free(json);
+    return send_err;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/groupstate/:nodeId  -> { "groupKeyMap":[..], "groupTable":[..] }
+// Read-only snapshot of a node's Group Key Management state, for diffing a
+// working group member against one that ignores the group multicast.
+// ---------------------------------------------------------------------------
+
+static esp_err_t groupstate_get_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    char *json = NULL;
+    esp_err_t err = matter_controller_get_group_state(node_id, &json);
+    if (err != ESP_OK || !json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read group state");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t send_err = httpd_resp_sendstr(req, json);
+    free(json);
+    return send_err;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/threadinfo/:nodeId  -> { "networkName", "extendedPanId", "panId",
+// "channel", "routingRole" }. Identifies which Thread network a device is on so
+// group members split across two Thread networks can be spotted.
+// ---------------------------------------------------------------------------
+
+static esp_err_t threadinfo_get_handler(httpd_req_t *req)
+{
+    const char *last_slash = strrchr(req->uri, '/');
+    if (!last_slash || *(last_slash + 1) == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_FAIL;
+    }
+    uint64_t node_id = strtoull(last_slash + 1, NULL, 10);
+    if (node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid node id");
+        return ESP_FAIL;
+    }
+
+    char *json = NULL;
+    esp_err_t err = matter_controller_get_thread_info(node_id, &json);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"networkName\":null,\"extendedPanId\":null,\"panId\":null,\"channel\":null,\"routingRole\":null}");
+    }
+    if (err != ESP_OK || !json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read Thread info");
         return ESP_FAIL;
     }
 
@@ -1012,7 +1127,9 @@ esp_err_t web_server_start(void)
     config.lru_purge_enable = true;
     config.uri_match_fn     = httpd_uri_match_wildcard;
     config.stack_size       = 12288;
-    config.max_uri_handlers = 32;
+    // Slot count must cover every httpd_register_uri_handler below PLUS the
+    // WebSocket handler registered by ws_server_init(); keep a little headroom.
+    config.max_uri_handlers = 36;
     config.max_resp_headers = 20;
 
     httpd_handle_t server = NULL;
@@ -1026,12 +1143,15 @@ esp_err_t web_server_start(void)
     const httpd_uri_t factory_reset      = {.uri = "/api/factory-reset",   .method = HTTP_POST,   .handler = factory_reset_post_handler};
     const httpd_uri_t devices_get        = {.uri = "/api/devices",         .method = HTTP_GET,    .handler = devices_get_handler};
     const httpd_uri_t device_delete      = {.uri = "/api/devices/*",       .method = HTTP_DELETE, .handler = device_delete_handler};
+    const httpd_uri_t device_name_put    = {.uri = "/api/devices/*",       .method = HTTP_PUT,    .handler = device_name_put_handler};
     const httpd_uri_t reinterview_post   = {.uri = "/api/reinterview/*",   .method = HTTP_POST,   .handler = reinterview_post_handler};
     const httpd_uri_t onoff_get          = {.uri = "/api/onoff/*",         .method = HTTP_GET,    .handler = onoff_get_handler};
     const httpd_uri_t onoff_put          = {.uri = "/api/onoff/*",         .method = HTTP_PUT,    .handler = onoff_put_handler};
     const httpd_uri_t identify_post      = {.uri = "/api/identify/*",      .method = HTTP_POST,   .handler = identify_post_handler};
     const httpd_uri_t acl_get            = {.uri = "/api/acl/*",           .method = HTTP_GET,    .handler = acl_get_handler};
     const httpd_uri_t bindingtable_get   = {.uri = "/api/bindingtable/*",  .method = HTTP_GET,    .handler = bindingtable_get_handler};
+    const httpd_uri_t groupstate_get     = {.uri = "/api/groupstate/*",    .method = HTTP_GET,    .handler = groupstate_get_handler};
+    const httpd_uri_t threadinfo_get     = {.uri = "/api/threadinfo/*",    .method = HTTP_GET,    .handler = threadinfo_get_handler};
     const httpd_uri_t nodes_get          = {.uri = "/api/nodes",           .method = HTTP_GET,    .handler = nodes_get_handler};
     const httpd_uri_t node_put           = {.uri = "/api/nodes/*",         .method = HTTP_PUT,    .handler = node_put_handler};
     const httpd_uri_t node_delete        = {.uri = "/api/nodes/*",         .method = HTTP_DELETE, .handler = node_delete_handler};
@@ -1058,12 +1178,15 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &factory_reset);
     httpd_register_uri_handler(server, &devices_get);
     httpd_register_uri_handler(server, &device_delete);
+    httpd_register_uri_handler(server, &device_name_put);
     httpd_register_uri_handler(server, &reinterview_post);
     httpd_register_uri_handler(server, &onoff_get);
     httpd_register_uri_handler(server, &onoff_put);
     httpd_register_uri_handler(server, &identify_post);
     httpd_register_uri_handler(server, &acl_get);
     httpd_register_uri_handler(server, &bindingtable_get);
+    httpd_register_uri_handler(server, &groupstate_get);
+    httpd_register_uri_handler(server, &threadinfo_get);
     httpd_register_uri_handler(server, &nodes_get);
     httpd_register_uri_handler(server, &node_put);
     httpd_register_uri_handler(server, &node_delete);

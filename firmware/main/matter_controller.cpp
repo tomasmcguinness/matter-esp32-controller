@@ -92,9 +92,18 @@ static constexpr uint8_t  kAclAuthModeGroup      = 3;
 // Group Key Management (0x003F) + Groups (0x0004) clusters for Matter groups.
 static constexpr uint32_t kGroupKeyMgmtCluster   = 0x003F;
 static constexpr uint32_t kGroupKeyMapAttribute  = 0x0000;  // GroupKeyMap (list)
+static constexpr uint32_t kGroupTableAttribute   = 0x0001;  // GroupTable / GroupInfoMap (list)
 static constexpr uint32_t kKeySetWriteCommand    = 0x0000;
 static constexpr uint32_t kKeySetRemoveCommand   = 0x0003;
 static constexpr uint32_t kGroupsCluster         = 0x0004;
+// Thread Network Diagnostics (0x0035) attributes that identify which Thread network
+// a device is on (NetworkName + ExtendedPanId) plus its mesh role.
+static constexpr uint32_t kThreadDiagCluster     = 0x0035;
+static constexpr uint32_t kThreadChannelAttr     = 0x0000;  // uint16
+static constexpr uint32_t kThreadRoutingRoleAttr = 0x0001;  // enum8
+static constexpr uint32_t kThreadNetworkNameAttr = 0x0002;  // string
+static constexpr uint32_t kThreadPanIdAttr       = 0x0003;  // uint16
+static constexpr uint32_t kThreadExtPanIdAttr    = 0x0004;  // uint64
 static constexpr uint32_t kAddGroupCommand       = 0x0000;
 static constexpr uint32_t kRemoveGroupCommand    = 0x0003;
 static constexpr uint32_t kRemoveAllGroupsCommand = 0x0004;
@@ -547,6 +556,26 @@ struct group_key_map_t {
 };
 static std::vector<group_key_map_t> s_group_key_map;
 
+// GroupTable (Group Key Management 0x003F attr 0x0001) entries: which endpoints the
+// device believes belong to each group. Captured for read-only diagnostics.
+struct group_table_entry_t {
+    uint16_t group_id;
+    std::vector<uint16_t> endpoints;
+    std::string name;
+};
+static std::vector<group_table_entry_t> s_group_table;
+
+// Thread Network Diagnostics snapshot captured for read-only display. Each field is
+// only valid if its has_* flag is set (devices may not implement every attribute).
+struct thread_diag_t {
+    bool has_channel = false; uint16_t channel = 0;
+    bool has_role = false;    uint8_t role = 0;
+    bool has_name = false;    std::string name;
+    bool has_panid = false;   uint16_t panid = 0;
+    bool has_xpanid = false;  uint64_t xpanid = 0;
+};
+static thread_diag_t s_thread_diag;
+
 static void on_rmw_read_done(uint64_t,
                              const chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> &,
                              const chip::Platform::ScopedMemoryBufferWithSize<chip::app::EventPathParams> &)
@@ -709,6 +738,87 @@ static void on_groupkeymap_read_attr(uint64_t,
             s_group_key_map.push_back(e);
     }
     data->ExitContainer(list_type);
+    s_rmw_read_ok = true;
+}
+
+// Captures the GroupTable (which endpoints are in which group) for read-only display.
+static void on_grouptable_read_attr(uint64_t,
+                                    const chip::app::ConcreteDataAttributePath &path,
+                                    chip::TLV::TLVReader *data,
+                                    const chip::app::StatusIB& status)
+{
+    if (!data || path.mClusterId != kGroupKeyMgmtCluster || path.mAttributeId != kGroupTableAttribute)
+        return;
+    s_group_table.clear();
+    chip::TLV::TLVType list_type;
+    if (data->EnterContainer(list_type) != CHIP_NO_ERROR)
+        return;
+    while (data->Next() == CHIP_NO_ERROR) {
+        chip::TLV::TLVType struct_type;
+        if (data->EnterContainer(struct_type) != CHIP_NO_ERROR)
+            continue;
+        group_table_entry_t e;
+        e.group_id = 0;
+        bool has_group = false;
+        while (data->Next() == CHIP_NO_ERROR) {
+            uint32_t tag = chip::TLV::TagNumFromTag(data->GetTag());
+            if (tag == 1) has_group = (data->Get(e.group_id) == CHIP_NO_ERROR);   // GroupId
+            else if (tag == 2 && data->GetType() == chip::TLV::kTLVType_Array) {  // Endpoints
+                chip::TLV::TLVType ep_type;
+                if (data->EnterContainer(ep_type) == CHIP_NO_ERROR) {
+                    while (data->Next() == CHIP_NO_ERROR) {
+                        uint16_t ep = 0;
+                        if (data->Get(ep) == CHIP_NO_ERROR)
+                            e.endpoints.push_back(ep);
+                    }
+                    data->ExitContainer(ep_type);
+                }
+            } else if (tag == 3 && data->GetType() == chip::TLV::kTLVType_UTF8String) { // GroupName
+                chip::CharSpan str;
+                if (data->Get(str) == CHIP_NO_ERROR)
+                    e.name.assign(str.data(), str.size());
+            }
+        }
+        data->ExitContainer(struct_type);
+        if (has_group)
+            s_group_table.push_back(std::move(e));
+    }
+    data->ExitContainer(list_type);
+    s_rmw_read_ok = true;
+}
+
+// Captures individual Thread Network Diagnostics attributes into s_thread_diag.
+// Called once per attribute across several targeted reads; the struct is reset by
+// the caller before the first read so partial results still populate.
+static void on_thread_diag_read_attr(uint64_t,
+                                     const chip::app::ConcreteDataAttributePath &path,
+                                     chip::TLV::TLVReader *data,
+                                     const chip::app::StatusIB&)
+{
+    if (!data || path.mClusterId != kThreadDiagCluster)
+        return;
+    switch (path.mAttributeId) {
+    case kThreadChannelAttr:
+        if (data->Get(s_thread_diag.channel) == CHIP_NO_ERROR) s_thread_diag.has_channel = true;
+        break;
+    case kThreadRoutingRoleAttr:
+        if (data->Get(s_thread_diag.role) == CHIP_NO_ERROR) s_thread_diag.has_role = true;
+        break;
+    case kThreadNetworkNameAttr: {
+        chip::CharSpan str;
+        if (data->Get(str) == CHIP_NO_ERROR) {
+            s_thread_diag.name.assign(str.data(), str.size());
+            s_thread_diag.has_name = true;
+        }
+        break;
+    }
+    case kThreadPanIdAttr:
+        if (data->Get(s_thread_diag.panid) == CHIP_NO_ERROR) s_thread_diag.has_panid = true;
+        break;
+    case kThreadExtPanIdAttr:
+        if (data->Get(s_thread_diag.xpanid) == CHIP_NO_ERROR) s_thread_diag.has_xpanid = true;
+        break;
+    }
     s_rmw_read_ok = true;
 }
 
@@ -898,6 +1008,126 @@ esp_err_t matter_controller_get_binding_table(uint64_t node_id, char **json_out)
         json += buf;
     }
     json += "]}";
+
+    char *out = (char *)malloc(json.size() + 1);
+    if (!out)
+        return ESP_ERR_NO_MEM;
+    memcpy(out, json.c_str(), json.size() + 1);
+    *json_out = out;
+    return ESP_OK;
+}
+
+// Read-only snapshot of a node's group state (EP0 Group Key Management cluster):
+// the GroupKeyMap (group -> keyset bindings) and the GroupTable (group -> member
+// endpoints). Intended for diffing a working member against a non-responding one.
+// { "groupKeyMap":[{"group":N,"keyset":N}],
+//   "groupTable":[{"group":N,"endpoints":[N,...],"name":"..."}] }
+esp_err_t matter_controller_get_group_state(uint64_t node_id, char **json_out)
+{
+    if (!json_out)
+        return ESP_ERR_INVALID_ARG;
+    *json_out = nullptr;
+
+    s_group_key_map.clear();
+    esp_err_t err = blocking_read_attr(node_id, 0, kGroupKeyMgmtCluster, kGroupKeyMapAttribute,
+                                       on_groupkeymap_read_attr);
+    if (err != ESP_OK)
+        return err;
+
+    s_group_table.clear();
+    err = blocking_read_attr(node_id, 0, kGroupKeyMgmtCluster, kGroupTableAttribute,
+                             on_grouptable_read_attr);
+    if (err != ESP_OK)
+        return err;
+
+    std::string json = "{\"groupKeyMap\":[";
+    for (size_t i = 0; i < s_group_key_map.size(); ++i) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s{\"group\":%u,\"keyset\":%u}",
+                 i ? "," : "", (unsigned)s_group_key_map[i].group_id,
+                 (unsigned)s_group_key_map[i].keyset_id);
+        json += buf;
+    }
+    json += "],\"groupTable\":[";
+    for (size_t i = 0; i < s_group_table.size(); ++i) {
+        const group_table_entry_t &e = s_group_table[i];
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s{\"group\":%u,\"endpoints\":[",
+                 i ? "," : "", (unsigned)e.group_id);
+        json += buf;
+        for (size_t j = 0; j < e.endpoints.size(); ++j) {
+            snprintf(buf, sizeof(buf), "%s%u", j ? "," : "", (unsigned)e.endpoints[j]);
+            json += buf;
+        }
+        json += "],\"name\":\"";
+        // Escape the group name defensively; it is device-supplied.
+        for (char c : e.name) {
+            if (c == '"' || c == '\\') json += '\\';
+            if ((unsigned char)c >= 0x20) json += c;
+        }
+        json += "\"}";
+    }
+    json += "]}";
+
+    char *out = (char *)malloc(json.size() + 1);
+    if (!out)
+        return ESP_ERR_NO_MEM;
+    memcpy(out, json.c_str(), json.size() + 1);
+    *json_out = out;
+    return ESP_OK;
+}
+
+// Read-only snapshot of a device's Thread Network Diagnostics (cluster 0x0035, EP0):
+// which Thread network it is on (NetworkName + ExtendedPanId + PanId + Channel) and
+// its mesh RoutingRole. Intended for spotting members that sit on a *different* Thread
+// network (so the controller's group multicast never reaches them). Fields absent on
+// the device are emitted as null. Reads are best-effort per attribute.
+esp_err_t matter_controller_get_thread_info(uint64_t node_id, char **json_out)
+{
+    if (!json_out)
+        return ESP_ERR_INVALID_ARG;
+    *json_out = nullptr;
+
+    s_thread_diag = thread_diag_t{};
+    blocking_read_attr(node_id, 0, kThreadDiagCluster, kThreadNetworkNameAttr, on_thread_diag_read_attr);
+    blocking_read_attr(node_id, 0, kThreadDiagCluster, kThreadExtPanIdAttr,    on_thread_diag_read_attr);
+    blocking_read_attr(node_id, 0, kThreadDiagCluster, kThreadPanIdAttr,       on_thread_diag_read_attr);
+    blocking_read_attr(node_id, 0, kThreadDiagCluster, kThreadChannelAttr,     on_thread_diag_read_attr);
+    blocking_read_attr(node_id, 0, kThreadDiagCluster, kThreadRoutingRoleAttr, on_thread_diag_read_attr);
+
+    const thread_diag_t &d = s_thread_diag;
+    // A device on no Thread network (e.g. reachable only over Wi-Fi/Ethernet) returns
+    // nothing for every attribute; report that rather than a misleading empty network.
+    if (!d.has_name && !d.has_xpanid && !d.has_panid && !d.has_channel && !d.has_role)
+        return ESP_ERR_NOT_FOUND;
+
+    std::string json = "{";
+    char buf[96];
+    if (d.has_name) {
+        json += "\"networkName\":\"";
+        for (char c : d.name) {
+            if (c == '"' || c == '\\') json += '\\';
+            if ((unsigned char)c >= 0x20) json += c;
+        }
+        json += "\",";
+    } else {
+        json += "\"networkName\":null,";
+    }
+    if (d.has_xpanid) {
+        snprintf(buf, sizeof(buf), "\"extendedPanId\":\"0x%016llX\",", (unsigned long long)d.xpanid);
+        json += buf;
+    } else {
+        json += "\"extendedPanId\":null,";
+    }
+    if (d.has_panid)   snprintf(buf, sizeof(buf), "\"panId\":%u,", (unsigned)d.panid);
+    else               snprintf(buf, sizeof(buf), "\"panId\":null,");
+    json += buf;
+    if (d.has_channel) snprintf(buf, sizeof(buf), "\"channel\":%u,", (unsigned)d.channel);
+    else               snprintf(buf, sizeof(buf), "\"channel\":null,");
+    json += buf;
+    if (d.has_role)    snprintf(buf, sizeof(buf), "\"routingRole\":%u}", (unsigned)d.role);
+    else               snprintf(buf, sizeof(buf), "\"routingRole\":null}");
+    json += buf;
 
     char *out = (char *)malloc(json.size() + 1);
     if (!out)
