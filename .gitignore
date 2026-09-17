@@ -83,3 +83,4 @@ firmware/html_compiled_app/
 .DS_Store
 
 .claude/
+.vscode/

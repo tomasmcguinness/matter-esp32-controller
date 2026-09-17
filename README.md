@@ -1,12 +1,20 @@
-# matter-esp32-controller
+# Matter ESP32 Controller
 
 This project sets out to create a Matter Controller which runs on an ESP32. It will give you a web interface for configuring and controlling devices.
 
-## Devices supported
+## Matter Device support
 
-At present, only On/Off Lights and On/Off Light Switches are supported in the canvas, but any device can be commissioned.
+At present, only On/Off Lights and On/Off Light Switches are supported in the canvas. Any device can be commissioned, but it won't be rendered.
 
 ## Flashing
+
+This project is designed to run on the Waveshare ESP32-S3-ETH devkit. I chose this DevKit as it has an integrated Ethernet port, SD Card port and even supports PoE.
+
+To flash, you'll need to both the esp-idf and esp-matter repositories installed.
+
+```
+idf.py build flash monitor
+```
 
 ## Commissioning Devices
 
